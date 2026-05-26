@@ -8,6 +8,21 @@
 
 ---
 
+## 환경 스펙
+
+| 항목 | 버전 |
+|------|------|
+| OS | Ubuntu 22.04 |
+| GPU| NVIDIA RTX 5080 Laptop (16GB VRAM) |
+| NVIDIA 드라이버 | 580.x 이상 (535 이상 필수) |
+| CUDA | 12.8 (호스트 cuRobo용) / 13.0 (Isaac Sim 내장) |
+| Isaac Sim | 5.1.0-rc.19 |
+| IsaacLab | 2.3.2 |
+| Python | 3.11.13 (Isaac Sim 내장) / 3.10 (시스템) |
+| PyTorch | 2.7.0+cu128 |
+
+---
+
 ## 팀 구성 및 담당 브랜치
 
 | 이름 | 역할 | 담당 브랜치 |
@@ -59,11 +74,14 @@ cd smart-shelf-robot
 ### 2. 의존성 설치
 
 ```bash
+# 호스트 환경
+pip install -r requirements/requirements_host.txt
+
+# Isaac Sim 환경
+~/isaacsim/python.sh -m pip install -r requirements/requirements_isaac.txt
+
 # ROS2 의존성
 rosdep install --from-paths src --ignore-src -r -y
-
-# Python 패키지
-pip install -r requirements.txt
 ```
 
 ### 3. 담당 브랜치로 체크아웃

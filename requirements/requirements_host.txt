@@ -1,0 +1,10 @@
+# cuRobo용
+numpy==1.26.4
+scipy
+jinja2
+typeguard
+groundingdino-py
+transformers==4.40.2
+warp-lang==1.0.2
+# torch는 아래 명령어로 별도 설치
+# python3 -m pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128

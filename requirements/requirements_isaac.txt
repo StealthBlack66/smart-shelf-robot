@@ -1,0 +1,4 @@
+# ~/isaacsim/python.sh -m pip install -r requirements/requirements_isaac.txt
+tensordict==0.12.3
+# rsl_rl은 특정 커밋으로 별도 설치
+# ~/isaacsim/python.sh -m pip install git+https://github.com/leggedrobotics/rsl_rl.git@d41387e2a7ffd6eda9ee2a4500bed167635d30a3

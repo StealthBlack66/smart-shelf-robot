@@ -1,6 +1,4 @@
-torch==2.x.x
-torchvision==x.x.x
-ultralytics==x.x.x  # YOLO
-numpy<2
-opencv-python==x.x.x
-pyrealsense2==x.x.x
+ultralytics==8.4.0  # YOLO
+numpy==1.26.4
+opencv-python==4.10.0
+pyrealsense2==2.57.0
