@@ -1,0 +1,28 @@
+# 물성별 파지힘 파라미터
+# 단위: N (뉴턴)
+# RH-P12-RN-A 최대 파지힘: 170N
+
+grasp_force:
+  bread:
+    force: 10.0        # 기본 파지힘
+    max_force: 15.0    # 상한 (소프트바디 변형 방지)
+    position: 0.8      # 그리퍼 닫힘 정도 (0.0~1.101 rad)
+    strategy: soft     # 파지 전략
+
+  snack:
+    force: 20.0
+    max_force: 30.0
+    position: 0.9
+    strategy: edge     # 끝단 파지 (봉지가 그리퍼보다 큼)
+
+  bottle:
+    force: 40.0
+    max_force: 60.0
+    position: 1.0
+    strategy: cylinder # 원통형 형상 기반
+
+  can:
+    force: 80.0
+    max_force: 100.0
+    position: 1.101
+    strategy: max      # 최대 파지힘 (금속, 미끄러운 표면)

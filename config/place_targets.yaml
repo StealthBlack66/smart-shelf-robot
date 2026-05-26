@@ -1,0 +1,58 @@
+# 매대 적재 목표 위치
+# 단위: m (미터), rad (라디안)
+# 기준 좌표계: base_link
+
+place_targets:
+  bread:
+    position:
+      x: 0.4
+      y: 0.2
+      z: 0.15
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+
+  snack:
+    position:
+      x: 0.4
+      y: 0.0
+      z: 0.15
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+
+  bottle:
+    position:
+      x: 0.4
+      y: -0.2
+      z: 0.15
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+
+  can:
+    position:
+      x: 0.4
+      y: -0.4
+      z: 0.15
+    orientation:
+      x: 0.0
+      y: 0.0
+      z: 0.0
+      w: 1.0
+
+# 홈 포지션
+home:
+  joint_positions:
+    joint_1: 0.0
+    joint_2: 0.0
+    joint_3: 0.0
+    joint_4: 0.0
+    joint_5: 0.0
+    joint_6: 0.0

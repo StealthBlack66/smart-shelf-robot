@@ -13,11 +13,11 @@
 | 이름 | 역할 | 담당 브랜치 |
 |------|------|------------|
 | 심예영 | 제어 통합 | `feat/integration-controller` |
-| 김민성 | 모션플래닝, 캘리브레이션 | `feat/motion-arm` |
-| 남상훈 | 비전 (감지) | `feat/vision-detection` |
-| 이현호 | 비전 (포즈) | `feat/vision-pose` |
-| 김인영 | 강화학습 | `feat/rl-policy` |
-| 남정혁 | 강화학습 | `feat/rl-policy` |
+| 김민성 | 모션플래닝, 캘리브레이션 | `feat/motion` |
+| 남상훈 | 비전 (감지) | `feat/vision1` |
+| 이현호 | 비전 (포즈) | `feat/vision2` |
+| 김인영 | 강화학습 | `feat/simtoreal` |
+| 남정혁 | 강화학습 | `feat/rl` |
 
 ---
 
@@ -69,15 +69,15 @@ pip install -r requirements.txt
 ### 3. 담당 브랜치로 체크아웃
 
 ```bash
-# 본인 담당 브랜치로 이동 (예: 비전 감지 담당)
-git checkout feat/vision-detection
+# 본인 담당 브랜치로 이동 (예: 강화학습 담당)
+git checkout feat/rl
 ```
 
 ### 4. ROS2 환경 설정
 
 ```bash
 # 모든 팀원 동일하게 설정
-export ROS_DOMAIN_ID=0
+export ROS_DOMAIN_ID=x
 source /opt/ros/humble/setup.bash
 source ~/doosan_ws/install/setup.bash
 ```
@@ -86,11 +86,10 @@ source ~/doosan_ws/install/setup.bash
 
 ## 네트워크 설정
 
-같은 와이파이 + 같은 ROS_DOMAIN_ID면 자동으로 통신돼.
+같은 와이파이 + 같은 ROS_DOMAIN_ID면 자동으로 통신
 
 ```bash
 # ~/.bashrc에 추가
-echo "export ROS_DOMAIN_ID=0" >> ~/.bashrc
 echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
 source ~/.bashrc
 
