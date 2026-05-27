@@ -1,0 +1,95 @@
+# Diffusion Policy 설정 - Pen Grasp (Low-dim State-based)
+# real-stanford/diffusion_policy 레포용 설정
+
+name: pen_grasp_lowdim
+_target_: diffusion_policy.workspace.train_diffusion_unet_lowdim_workspace.TrainDiffusionUnetLowdimWorkspace
+
+# Task 설정
+task:
+  name: pen_grasp
+  dataset:
+    _target_: diffusion_policy.dataset.base_dataset.BaseLowdimDataset
+    zarr_path: ${oc.env:DATA_DIR}/pen_grasp.zarr
+    horizon: 16
+    pad_before: 1
+    pad_after: 7
+    seed: 42
+    val_ratio: 0.02
+  shape_meta:
+    obs:
+      state:
+        shape: [25]  # joint(6) + vel(6) + ee_pos(3) + ee_quat(4) + pen_pos(3) + pen_axis(3)
+    action:
+      shape: [6]  # joint positions
+
+# Policy 설정
+policy:
+  _target_: diffusion_policy.policy.diffusion_unet_lowdim_policy.DiffusionUnetLowdimPolicy
+
+  model:
+    _target_: diffusion_policy.model.diffusion.conditional_unet1d.ConditionalUnet1D
+    input_dim: 6  # action dim
+    local_cond_dim: null
+    global_cond_dim: 25  # state dim
+    diffusion_step_embed_dim: 128
+    down_dims: [256, 512, 1024]
+    kernel_size: 3
+    n_groups: 8
+    cond_predict_scale: true
+
+  noise_scheduler:
+    _target_: diffusers.schedulers.scheduling_ddpm.DDPMScheduler
+    num_train_timesteps: 100
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    variance_type: fixed_small
+    clip_sample: true
+    prediction_type: epsilon
+
+  horizon: 16
+  obs_dim: 25
+  action_dim: 6
+  n_action_steps: 8
+  n_obs_steps: 2
+  num_inference_steps: 16
+
+# EMA 설정
+ema:
+  _target_: diffusion_policy.model.common.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+# 학습 설정
+training:
+  device: cuda:0
+  seed: 42
+  num_epochs: 500
+  gradient_accumulate_every: 1
+  lr: 1.0e-4
+  weight_decay: 1.0e-6
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+
+  # DataLoader
+  batch_size: 64
+  num_workers: 4
+
+  # Logging
+  log_freq: 100
+  save_freq: 50
+
+  # Checkpoint
+  checkpoint_every: 50
+  resume: true
+
+# Logging 설정
+logging:
+  project: pen_grasp_diffusion
+  mode: online
+  name: ${now:%Y.%m.%d-%H.%M.%S}_pen_grasp_lowdim
+  id: null
+  group: null

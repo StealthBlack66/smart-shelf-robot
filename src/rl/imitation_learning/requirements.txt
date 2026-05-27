@@ -1,0 +1,16 @@
+# Diffusion Policy 학습 환경 의존성
+
+# Core
+torch>=2.0.0
+numpy>=1.24.0
+zarr>=2.16.0
+
+# Diffusion
+diffusers>=0.21.0
+
+# Training
+tqdm>=4.65.0
+wandb>=0.15.0  # optional, for logging
+
+# Data processing
+scipy>=1.10.0

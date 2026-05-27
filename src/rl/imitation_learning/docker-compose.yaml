@@ -1,0 +1,51 @@
+# Diffusion Policy 학습용 Docker Compose
+# 사용법:
+#   cd ~/CoWriteBotRL/pen_grasp_rl/imitation_learning
+#   docker compose up -d
+#   docker compose exec diffusion bash
+
+version: '3.8'
+
+services:
+  diffusion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: diffusion-policy:latest
+    container_name: diffusion-policy
+
+    # GPU 사용
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # 볼륨 마운트
+    volumes:
+      # 학습 스크립트
+      - .:/workspace/imitation_learning
+      # 데이터
+      - ../../data:/workspace/data
+      # 체크포인트 저장
+      - ../../checkpoints:/workspace/checkpoints
+      # 로그
+      - ../../logs/diffusion:/workspace/logs
+
+    # 환경변수
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+
+    # 대화형 모드
+    stdin_open: true
+    tty: true
+
+    # 포트 (TensorBoard용)
+    ports:
+      - "6007:6006"
+
+    # 컨테이너 유지
+    command: tail -f /dev/null
