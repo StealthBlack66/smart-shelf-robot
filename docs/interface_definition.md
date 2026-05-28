@@ -47,11 +47,25 @@
 ## Task State Machine
 
 ```
-IDLE → MOVE_TO_SHELF_VIEW → SHELF_DETECTING → MOVE_TO_PRODUCT_VIEW → PRODUCT_DETECTING → MOVING_PICK → GRASPING → MOVING_PLACE → PLACING → DONE
-                                  ↓                                          ↓                                                                  ↓
-                             (빈 슬롯 없음)                             (상품 미검출)                                                         IDLE
-                                  ↓                                          ↓
-                                 IDLE                               MOVE_TO_SHELF_VIEW
+IDLE
+  ↓
+MOVE_TO_SHELF_VIEW
+  ↓
+SHELF_DETECTING ──(빈 슬롯 없음)──→ IDLE
+  ↓
+MOVE_TO_PRODUCT_VIEW
+  ↓
+PRODUCT_DETECTING ──(상품 미검출)──→ MOVE_TO_SHELF_VIEW
+  ↓
+MOVING_PICK ──(실패)──→ ERROR → IDLE
+  ↓
+GRASPING ──(실패)──→ ERROR → IDLE
+  ↓
+MOVING_PLACE ──(실패)──→ ERROR → IDLE
+  ↓
+PLACING
+  ↓
+DONE → IDLE
 ```
 
 ### 단계별 설명
