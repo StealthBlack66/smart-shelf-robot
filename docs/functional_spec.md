@@ -9,7 +9,7 @@
 | 프로젝트명 | smart-shelf-robot |
 | 목적 | 상품을 감지하고 물성에 맞는 파지힘으로 매대에 자동 정리 |
 | 로봇 | Doosan E0509 + RH-P12-RN-A 그리퍼 |
-| 카메라 | RealSense D455f x2 (Eye-to-hand / Eye-in-hand) |
+| 카메라 | RealSense D455f x2 (Eye-to-hand) |
 | 환경 | Ubuntu 22.04 + ROS2 Humble |
 
 ---
@@ -54,7 +54,7 @@
 | 항목 | 내용 |
 |------|------|
 | 담당 | 비전팀 |
-| 카메라 | Eye-in-hand (로봇 손목) |
+| 카메라 | Eye-to-hand (상품 구역 관찰) |
 | 입력 | `/camera_product/color/image_raw`, `/camera_product/depth/image_rect_raw`, `/shelf/empty_slot` |
 | 출력 | `/object_class`, `/object_pose` |
 
