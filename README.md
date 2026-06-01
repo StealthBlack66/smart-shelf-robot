@@ -31,7 +31,7 @@
 | 김민성 | 모션플래닝, 캘리브레이션 | `feat/motion` |
 | 남상훈 | 비전 (감지) | `feat/vision1` |
 | 이현호 | 비전 (포즈) | `feat/vision2` |
-| 김인영 | sim2real | `feat/simtoreal` |
+| 김인영 | VLA | `feat/simtoreal` |
 | 남정혁 | isaacsim/isaaclab 강화학습 | `feat/rl` |
 
 ---
@@ -47,7 +47,7 @@ smart-shelf-robot/
 │   ├── motion/      # -> 모션플래닝
 │   │   ├── arm_controller_node.py  # 로봇 팔 경로 계획
 │   │   └── gripper_node.py         # 그리퍼 파지힘 제어
-│   ├── rl/          # -> 강화학습팀
+│   ├── rl/          # -> 시뮬레이션팀
 │   │   └── policy_node.py          # 강화학습 policy 추론
 │   └── integration/
 │       └── main_controller_node.py # 전체 상태머신

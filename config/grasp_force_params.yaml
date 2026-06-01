@@ -3,13 +3,7 @@
 # RH-P12-RN-A 최대 파지힘: 170N
 
 grasp_force:
-  bread:
-    force: 10.0        # 기본 파지힘
-    max_force: 15.0    # 상한 (소프트바디 변형 방지)
-    position: 0.8      # 그리퍼 닫힘 정도 (0.0~1.101 rad)
-    strategy: soft     # 파지 전략
-
-  snack:
+  snack_bag:
     force: 20.0
     max_force: 30.0
     position: 0.9
