@@ -160,11 +160,10 @@ chore:    설정, 의존성 등
 
 **핵심 토픽:**
 ```
-/object_class   → 감지된 물체 클래스 (bread/snack/bottle/can)
-/object_pose    → 물체 3D 위치 및 자세
-/grasp_force    → 파지힘 (N)
-/place_target   → 매대 적재 목표 위치
-/policy/action  → 강화학습 policy 출력
+/object_class        → 감지된 물체 클래스 (bread/snack/bottle/can)
+/object_pose         → 물체 3D 위치 및 자세
+/object_pointcloud   → YOLO/SAM 세그멘테이션 결과 포인트클라우드 (→ GraspGen)
+/place_target        → 매대 적재 목표 위치
 ```
 
 ---

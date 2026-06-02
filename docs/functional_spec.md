@@ -42,6 +42,7 @@
 | VS-05 | 3D 포즈 추정 | depth + 카메라 내부 파라미터로 상품 3D 좌표 계산 | PRODUCT_DETECTING |
 | VS-06 | 좌표계 변환 | 카메라 좌표 → 로봇 base_link 좌표계 변환 (TF) | PRODUCT_DETECTING |
 | VS-07 | 미검출 처리 | 해당 클래스 미검출 시 integration 노드에 알림 | PRODUCT_DETECTING |
+| VS-08 | 포인트클라우드 발행 | SAM 세그멘테이션 결과로 물체 영역 포인트클라우드 추출 후 `/object_pointcloud` 발행 | PRODUCT_DETECTING |
 
 **슬롯-클래스 매핑 (place_targets.yaml 기준)**
 
@@ -60,14 +61,14 @@
 | 담당 | 심예영 |
 | 입력 | `/shelf/empty_slot`, `/object_class`, `/object_pose` |
 | 출력 | `/place_target` |
-| 참조 파일 | `config/grasp_pose_sim.yaml`, `config/place_targets.yaml`, `config/grasp_force_params.yaml` |
+| 참조 파일 | `config/place_targets.yaml`, `config/grasp_force_params.yaml` |
 | 서비스 클라이언트 | `/move_to_shelf_view`, `/move_to_product_view`, `/move_to_pick`, `/move_to_place`, `/move_to_home`, `/gripper/open` |
 | 액션 클라이언트 | `/gripper/grasp` |
 
 | 기능 ID | 기능명 | 설명 |
 |---------|--------|------|
 | IN-01 | 상태머신 관리 | IDLE → MOVE_TO_SHELF_VIEW → SHELF_DETECTING → MOVE_TO_PRODUCT_VIEW → PRODUCT_DETECTING → MOVING_PICK → GRASPING → MOVING_PLACE → PLACING → DONE 순서 제어 |
-| IN-02 | 파지 자세 계산 | object_pose + grasp_pose_sim.yaml(물체 기준 좌표) → 월드 좌표계 파지 자세 계산 |
+| IN-02 | 파지 서비스 호출 | `/move_to_pick` 서비스 호출 (파지 자세 계산은 simulation 노드가 담당) |
 | IN-03 | 목표전류 결정 | 상품 클래스에 따라 목표전류 결정 후 /gripper/grasp 액션 goal로 전달 |
 | IN-04 | 적재 위치 결정 | 빈 슬롯 번호에 따라 place_targets.yaml에서 좌표 조회 후 /place_target 발행 |
 | IN-05 | 에러 처리 | 상품 미검출, 파지 실패, 이동 실패 시 안전 복귀 |
@@ -103,18 +104,16 @@
 | 담당 | 김민성 |
 | 입력 | `/place_target` |
 | 출력 | `/joint_command` |
-| 서비스 서버 | `/move_to_shelf_view`, `/move_to_product_view`, `/move_to_pick`, `/move_to_place`, `/move_to_home` |
+| 서비스 서버 | `/move_to_shelf_view`, `/move_to_product_view`, `/move_to_place`, `/move_to_home` |
 | 모션 플래닝 | cuRobo (노드 내부 통합) |
 
 | 기능 ID | 기능명 | 설명 |
 |---------|--------|------|
 | MO-01 | 매대 관찰 위치 이동 | /move_to_shelf_view 수신 시 홈(매대 정면) 포지션으로 이동 |
 | MO-02 | 상품 구역 이동 | /move_to_product_view 수신 시 상품 구역 관찰 위치로 이동 |
-| MO-03 | 파지 위치 이동 | /move_to_pick 수신 시 integration이 계산한 파지 자세로 이동 |
-| MO-04 | 적재 위치 이동 | /move_to_place 수신 시 place_target 기반 경로 계획 및 이동 |
-| MO-05 | 홈 복귀 | /move_to_home 수신 시 홈 포지션으로 이동 |
-| MO-06 | cuRobo 경로 계획 | 충돌 회피 포함한 경로 계획 |
-| MO-07 | 캘리브레이션 | Eye-in-hand 카메라 ↔ 로봇 좌표계 캘리브레이션 |
+| MO-03 | 적재 위치 이동 | /move_to_place 수신 시 place_target 기반 경로 계획 및 이동 |
+| MO-04 | 홈 복귀 | /move_to_home 수신 시 홈 포지션으로 이동 |
+| MO-05 | 캘리브레이션 | Eye-in-hand 카메라 ↔ 로봇 좌표계 캘리브레이션 |
 
 ---
 
@@ -138,20 +137,38 @@
 
 ---
 
-### 3-5. simulation 노드 (Isaac Sim, 오프라인)
+### 3-5. simulation 노드 (GraspGen + cuRobo, 온라인)
 
 | 항목 | 내용 |
 |------|------|
 | 담당 | 남정혁 |
-| 역할 | Isaac Sim에서 물체별 최적 파지 자세 시뮬레이션 후 결과를 yaml로 저장 |
-| 출력 | `config/grasp_pose_sim.yaml` (정적 파일, 토픽 아님) |
-| 실행 시점 | 배포 전 오프라인 실행 (실시간 통신 없음) |
+| 역할 | 물체 포인트클라우드로 파지 자세 동적 생성(GraspGen) + cuRobo 궤적 계획 후 파지 실행 |
+| 실행 환경 | 워크스테이션 · conda env: isaacsim (cuRobo v0.7.8 + Isaac Sim) |
+| 내부 통신 | ZMQ localhost:5556 → conda env: graspgen (GraspGen ZMQ 서버, PointNet++) |
+| 입력 (ROS2) | `/object_pointcloud` (`sensor_msgs/PointCloud2`) |
+| 서비스 서버 | `/move_to_pick` (`std_srvs/Trigger`) |
+| 출력 (ROS2) | `/joint_command` (`sensor_msgs/JointState`) |
 
 | 기능 ID | 기능명 | 설명 |
 |---------|--------|------|
-| SIM-01 | 물체 모델 로드 | Isaac Sim에 물체 4종 USD 모델 로드 |
-| SIM-02 | 파지 자세 탐색 | 물체 기준 좌표계에서 최적 파지 위치/자세 시뮬레이션 |
-| SIM-03 | 결과 저장 | 시뮬레이션 결과를 grasp_pose_sim.yaml로 저장 |
+| SIM-01 | 포인트클라우드 수신 | `/object_pointcloud` 구독, 최신 물체 포인트클라우드 유지 |
+| SIM-02 | GraspGen 호출 | ZMQ로 graspgen 서버에 포인트클라우드 전송, 파지 후보 수신 |
+| SIM-03 | 파지 자세 선택 | GraspGen이 반환한 후보 중 최적 파지 자세 선택 |
+| SIM-04 | cuRobo 궤적 계획 | 파지 자세 기반 충돌 회피 궤적 계획 |
+| SIM-05 | `/move_to_pick` 응답 | integration 노드의 서비스 콜에 SIM-02~SIM-04 실행 후 결과 반환 |
+| SIM-06 | 시뮬/실기체 전환 | 입력 소스(Isaac Sim 카메라 / RealSense D455)에 따라 동일 코어 공유 |
+
+**내부 구조도:**
+
+```
+[ROS2] /object_pointcloud
+        ↓
+  isaacsim conda 환경
+  ├── ZMQ client → :5556 → graspgen conda (GraspGen ZMQ 서버)
+  │                              ↓ 파지 후보 반환
+  ├── cuRobo v0.7.8 (궤적 계획)
+  └── /move_to_pick 서비스 응답 + /joint_command 발행 → [ROS2]
+```
 
 ---
 
@@ -172,7 +189,7 @@
 |------|----------|------|
 | `config/grasp_force_params.yaml` | 김민성 | 물체별 목표전류 파라미터 |
 | `config/place_targets.yaml` | 김민성 | 매대 슬롯별 적재 위치 좌표 |
-| `config/grasp_pose_sim.yaml` | 남정혁 | Isaac Sim 기반 물체 기준 파지 자세 |
+| `config/grasp_pose_sim.yaml` | 남정혁 | ~~Isaac Sim 정적 파지 자세~~ (GraspGen으로 대체, 미사용) |
 
 ---
 

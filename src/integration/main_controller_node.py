@@ -46,7 +46,6 @@ class MainControllerNode(Node):
 
         # config 로드
         config_dir = os.path.join(os.path.dirname(__file__), '..', '..', 'config')
-        self._grasp_pose = self._load_yaml(os.path.join(config_dir, 'grasp_pose_sim.yaml'))
         self._place_targets = self._load_yaml(os.path.join(config_dir, 'place_targets.yaml'))
 
         # Subscribers
