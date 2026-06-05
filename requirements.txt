@@ -1,6 +1,44 @@
-torch==2.x.x
-torchvision==x.x.x
-ultralytics==x.x.x  # YOLO
-numpy<2
-opencv-python==x.x.x
-pyrealsense2==x.x.x
+# smart-shelf-robot vision 노드 (webcam_seg_node.py) pip 요구사항
+# 검증 환경: Python 3.10, Ubuntu 22.04, ROS2 humble
+# ※ rclpy / std_srvs / geometry_msgs 는 pip 가 아니라 ROS2 humble 설치에 포함됨
+
+# --- 딥러닝 / YOLO ---
+torch>=2.1            # GPU 사용 시 CUDA 빌드 권장 (예: --index-url https://download.pytorch.org/whl/cu121)
+torchvision>=0.16
+ultralytics==8.4.51   # YOLO11s-seg (pose_robust_seg.pt)
+
+# --- 영상 / 수치 ---
+numpy<2               # ultralytics/opencv ABI 호환 (numpy 2.x 충돌 주의)
+opencv-python==4.6.0.66
+Pillow>=10.0          # 외곽선/좌표 텍스트 draw
+
+# --- 카메라 (RealSense) ---
+pyrealsense2==2.57.7.10387
+
+# --- 입력 (키보드 단축키) ---
+pynput==1.8.2
+
+# --- 외곽선(노란선) 정밀화 — ★★ 외곽선 품질의 실제 드라이버 ★★ ---
+#   외곽 워커 우선순위: HQ-SAM > SAM2 > ISNet (앞엣것 있으면 그걸 씀)
+#   ▸ GPU 있음 → SAM2 가 외곽선 담당 (가장 tight). ENABLE_SAM2=1 필수.
+#   ▸ GPU 없음 → ISNet(CPU) fallback. 거칠지만 동작.
+SAM-2==1.0            # import 명 sam2. SAM2 정밀 외곽 (models/sam2_hiera_large.pt 번들, 898MB). GPU 필요
+rembg==2.0.69         # ISNet fallback (models/isnet-general-use.onnx 번들, 170MB). CPU
+onnxruntime==1.23.2   # rembg 백엔드
+
+# --- 보조 검출 (미학습 객체 open-vocab) — 번들됨 ---
+groundingdino-py==0.4.0   # models/groundingdino_swint_ogc.pth 번들(694MB), config 는 패키지 제공. GPU 필요
+
+# === 선택 (기본 OFF, 필요 시만) ===
+# paddleocr                    # OCR (기본 OFF)
+# transformers, bitsandbytes   # Qwen2.5-VL (기본 OFF)
+
+# =====================================================================
+# 실행 (scripts/ 에서):
+#   export U2NET_HOME="$(pwd)/../models"   # ISNet onnx 위치 (CPU fallback 용)
+#   export ENABLE_SAM2=1                   # SAM2 외곽선 켜기 (GPU 필수)
+#   export DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority
+#   python3 -u webcam_seg_node.py
+# 부팅 로그에 "정밀외곽 워커 시작 (SAM2 ...)" 뜨면 외곽선 정상.
+# "정밀외곽 워커 시작 (ISNet ...)" 면 SAM2 미작동(GPU/패키지 확인) → 외곽 거침.
+# =====================================================================

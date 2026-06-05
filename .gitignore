@@ -1,0 +1,3 @@
+src/vision/models/
+__pycache__/
+*.pyc
