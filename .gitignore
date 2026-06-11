@@ -1,0 +1,23 @@
+# ROS 2 Local Build Artifacts
+build/
+install/
+log/
+.catkin_tools/
+
+# Python Runtime Garbage
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# External Repositories (Managed by smart-shelf-robot.repos)
+src/external/
+
+# Imitation Learning / Diffusion Policy Datasets & Weights
+src/custom/rl/data/
+src/custom/rl/checkpoints/
+*.mp4
+*.parquet
+
+# Isaac Lab & Physical AI Core
+third_party/

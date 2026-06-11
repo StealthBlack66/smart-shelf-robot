@@ -1,0 +1,17 @@
+repositories:
+  src/external/doosan-robot2:
+    type: git
+    url: https://github.com/fhekwn549/doosan-robot2.git
+    version: humble
+  src/external/RH-P12-RN-A:
+    type: git
+    url: https://github.com/ROBOTIS-GIT/RH-P12-RN-A.git
+    version: main
+  src/external/e0509_gripper_description:
+    type: git
+    url: https://github.com/fhekwn549/e0509_gripper_description.git
+    version: main
+  src/external/handeye_calibration_ros2:
+    type: git
+    url: https://github.com/shengyangzhuang/handeye_calibration_ros2.git
+    version: main
