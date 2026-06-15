@@ -1,0 +1,108 @@
+# Interface Definition
+
+## Topics
+
+| 토픽 | 타입 | 발행자 | 구독자 | 설명 |
+|------|------|--------|--------|------|
+| `/camera/color/image_raw` | `sensor_msgs/Image` | camera | vision | Eye-in-hand 카메라 컬러 이미지 |
+| `/camera/depth/image_rect_raw` | `sensor_msgs/Image` | camera | vision | Eye-in-hand 카메라 depth 이미지 |
+| `/shelf/empty_slot` | `std_msgs/String` | vision | integration | 빈 매대 슬롯 정보 (슬롯 번호 + 클래스, 예: "1,can") |
+| `/shelf/slot_status` | `std_msgs/String` | vision | integration | 전체 매대 상태 (예: "1:empty,2:full,3:empty,4:full") |
+| `/object_class` | `std_msgs/String` | vision | integration | 검출된 상품 클래스 (bread/snack/bottle/can) |
+| `/object_pose` | `geometry_msgs/PoseStamped` | vision | integration | 상품 3D 위치 및 자세 |
+| `/object_pointcloud` | `sensor_msgs/PointCloud2` | vision | simulation | YOLO/SAM 세그멘테이션 결과 물체 포인트클라우드 (GraspGen 입력) |
+| `/place_target` | `geometry_msgs/PoseStamped` | integration | motion | 매대 적재 목표 위치 |
+| `/joint_command` | `sensor_msgs/JointState` | motion, simulation | robot | 로봇 관절 명령 |
+| `/gripper_command` | `sensor_msgs/JointState` | gripper | robot | 그리퍼 관절 명령 |
+
+## Services
+
+| 서비스 | 타입 | 서버 | 클라이언트 | 설명 |
+|--------|------|------|-----------|------|
+| `/move_to_shelf_view` | `std_srvs/Trigger` | motion | integration | 매대 관찰 위치(홈)로 이동 |
+| `/move_to_product_view` | `std_srvs/Trigger` | motion | integration | 상품 구역 관찰 위치로 이동 |
+| `/move_to_pick` | `std_srvs/Trigger` | simulation | integration | GraspGen+cuRobo로 파지 위치 계산 및 이동 |
+| `/move_to_place` | `std_srvs/Trigger` | motion | integration | 적재 위치로 이동 |
+| `/move_to_home` | `std_srvs/Trigger` | motion | integration | 홈 포지션으로 이동 |
+| `/gripper/open` | `std_srvs/Trigger` | gripper | integration | 그리퍼 열기 |
+
+## Actions
+
+| 액션 | 타입 | 서버 | 클라이언트 | 설명 |
+|------|------|------|-----------|------|
+| `/gripper/grasp` | `control_msgs/GripperCommand` | gripper | integration | 전류 기반 파지 (goal: 목표전류 / feedback: 진행전류) |
+
+## Object Classes
+
+| 클래스 | 목표전류 (mA) | 최대전류 (mA) | 비고 |
+|--------|-------------|-------------|------|
+| `bread` | 100 | 150 | 소프트바디, 상한 제어 |
+| `snack` | 200 | 300 | 봉지 끝단 파지 |
+| `bottle` | 400 | 600 | 원통형, 적정 파지힘 |
+| `can` | 800 | 1000 | 금속, 미끄럼 방지 |
+
+## Camera
+
+| 카메라 | 위치 | 역할 |
+|--------|------|------|
+| Eye-in-hand | 로봇 손목 | task.1: 홈 위치에서 매대 슬롯 감지 / task.2: 상품 구역 이동 후 상품 검출 |
+
+## Simulation 노드 내부 구조 (GraspGen + cuRobo)
+
+시뮬레이션팀은 두 conda 환경을 ZMQ로 연결하여 파지 자세 생성과 궤적 계획을 수행한다.
+
+```
+워크스테이션 (Ubuntu 22.04 · RTX 5080 · CUDA 12.8)
+┌─────────────────────────────┐     ZMQ      ┌─────────────────────────────┐
+│  conda env: graspgen        │ ←──:5556──→  │  conda env: isaacsim        │
+│  GraspGen ZMQ 서버          │              │  Stage3: cuRobo v0.7.8      │
+│  PointNet++ · port 5556     │              │  ZMQ client + Isaac Sim     │
+└─────────────────────────────┘              └─────────────────────────────┘
+```
+
+**동작 흐름:**
+
+| 모드 | 입력 | 처리 | 출력 |
+|------|------|------|------|
+| 시뮬 | Isaac Sim 카메라 (가상 장면) | GraspGen → cuRobo | Isaac Sim 로봇 실행 |
+| 실기체 | RealSense D455 + YOLO/SAM | GraspGen → cuRobo | Doosan E0509 + 그리퍼 실행 |
+
+**ROS2 연동:** isaacsim conda 환경에서 실행되는 ROS2 노드가 `/object_pointcloud`를 구독하여 ZMQ로 GraspGen 서버에 전달, 파지 자세를 받아 cuRobo로 궤적 계획 후 `/move_to_pick` 서비스로 응답한다.
+
+## Task State Machine
+
+```
+IDLE
+  ↓
+MOVE_TO_SHELF_VIEW
+  ↓
+SHELF_DETECTING ──(빈 슬롯 없음)──→ IDLE
+  ↓
+MOVE_TO_PRODUCT_VIEW
+  ↓
+PRODUCT_DETECTING ──(상품 미검출)──→ MOVE_TO_SHELF_VIEW
+  ↓
+MOVING_PICK ──(실패)──→ ERROR → IDLE
+  ↓
+GRASPING ──(실패)──→ ERROR → IDLE
+  ↓
+MOVING_PLACE ──(실패)──→ ERROR → IDLE
+  ↓
+PLACING
+  ↓
+DONE → IDLE
+```
+
+### 단계별 설명
+
+| 단계 | 담당 | 설명 |
+|------|------|------|
+| `MOVE_TO_SHELF_VIEW` | motion | 홈 위치(매대 정면)로 이동 |
+| `SHELF_DETECTING` | vision | 매대 스캔, 빈 슬롯 + 필요 클래스 `/shelf/empty_slot`으로 발행 |
+| `MOVE_TO_PRODUCT_VIEW` | motion | 상품 구역 관찰 위치로 이동 |
+| `PRODUCT_DETECTING` | vision | 상품 구역에서 해당 클래스 검출, `/object_pose` 발행 |
+| `MOVING_PICK` | simulation | GraspGen이 `/object_pointcloud`로 파지 자세 생성, cuRobo로 경로 계획 및 이동 |
+| `GRASPING` | gripper | 목표전류 기반 파지 (액션) |
+| `MOVING_PLACE` | motion | 빈 매대 슬롯 위치로 이동 |
+| `PLACING` | gripper | 그리퍼 열어 상품 적재 |
+| `DONE` | integration | 작업 완료 후 IDLE로 복귀 |

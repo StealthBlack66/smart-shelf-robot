@@ -1,3 +1,26 @@
+# === 대용량 모델 (GitHub 100MB 제한 초과 — 레포에 올리지 않음) ===
 src/vision/models/
+# 확장자 기반 안전망 (models/ 밖에 생겨도 차단)
+*.pt
+*.pth
+*.onnx
+*.engine
+*.plan
+*.weights
+
+# === Python 캐시 ===
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# === ROS2 빌드 산출물 ===
+build/
+install/
+log/
+
+# === 기타 ===
+*.bag
+*.db3
+.vscode/
+*.swp

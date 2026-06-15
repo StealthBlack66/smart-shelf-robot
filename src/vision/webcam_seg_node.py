@@ -261,6 +261,26 @@ def to_graspgen_label(seg_name):
     return GRASPGEN_LABEL_MAP.get(str(seg_name).strip().lower())
 
 
+def _rotm_to_quat(R):
+    """3x3 회전행렬 → 쿼터니언 [x,y,z,w]."""
+    import numpy as _np
+    t = R[0, 0] + R[1, 1] + R[2, 2]
+    if t > 0:
+        s = _np.sqrt(t + 1.0) * 2
+        w = 0.25 * s; x = (R[2, 1]-R[1, 2])/s; y = (R[0, 2]-R[2, 0])/s; z = (R[1, 0]-R[0, 1])/s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = _np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2
+        w = (R[2, 1]-R[1, 2])/s; x = 0.25*s; y = (R[0, 1]+R[1, 0])/s; z = (R[0, 2]+R[2, 0])/s
+    elif R[1, 1] > R[2, 2]:
+        s = _np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2
+        w = (R[0, 2]-R[2, 0])/s; x = (R[0, 1]+R[1, 0])/s; y = 0.25*s; z = (R[1, 2]+R[2, 1])/s
+    else:
+        s = _np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2
+        w = (R[1, 0]-R[0, 1])/s; x = (R[0, 2]+R[2, 0])/s; y = (R[1, 2]+R[2, 1])/s; z = 0.25*s
+    q = _np.array([x, y, z, w], dtype=float)
+    return q / (_np.linalg.norm(q) + 1e-9)
+
+
 obj_dicts = {}
 
 obj_dicts['이름'] = { # 이름은 예를들어 콜라 로 감지가되면 콜라 로 적어주셈
@@ -286,8 +306,28 @@ obj_dicts['이름'] = { # 이름은 예를들어 콜라 로 감지가되면 콜�
 # launch_webcam.sh 동일 환경을 단독 실행 시에도 자동 설정.
 # setup.bash 의 모든 환경변수를 그대로 import (수십개 — PATH, LD_LIBRARY_PATH,
 # AMENT_PREFIX_PATH, CMAKE_PREFIX_PATH, PYTHONPATH, ROS_DISTRO 등).
+def _detect_active_display():
+    """활성 GUI 세션의 DISPLAY 자동 탐지 (gnome-shell/Xorg 프로세스 environ).
+    하드코딩 :1 이 세션 바뀌면 틀려서(실제 :2 등) 자동 감지로 대체."""
+    import glob
+    for pat in ('gnome-shell', 'gnome-session', 'Xorg'):
+        for pid_dir in glob.glob('/proc/[0-9]*'):
+            try:
+                with open(f'{pid_dir}/comm') as f:
+                    if pat not in f.read():
+                        continue
+                with open(f'{pid_dir}/environ', 'rb') as f:
+                    for kv in f.read().decode('utf-8', 'ignore').split('\x00'):
+                        if kv.startswith('DISPLAY=') and kv[8:]:
+                            return kv[8:]
+            except Exception:
+                continue
+    return None
+
+
 def _autosource_ros_env():
-    os.environ.setdefault('DISPLAY', ':1')
+    if not os.environ.get('DISPLAY'):
+        os.environ['DISPLAY'] = _detect_active_display() or ':0'
     os.environ.setdefault('XAUTHORITY', '/run/user/1000/gdm/Xauthority')
     # 이미 ROS_DISTRO 설정돼있으면 source 안 함 (이미 source 된 환경에서 실행됨)
     if os.environ.get('ROS_DISTRO'):
@@ -449,8 +489,41 @@ import rclpy
 from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Point
+from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
+from visualization_msgs.msg import Marker
+try:
+    from dsr_msgs2.srv import MoveStop   # 두산 비상정지 (스페이스바)
+    _MOVESTOP_AVAIL = True
+except Exception:
+    _MOVESTOP_AVAIL = False
+try:
+    from dsr_gripper_tcp_interfaces.srv import SetPosition  # 그리퍼 열기(브리지)
+    _SETPOS_AVAIL = True
+except Exception:
+    _SETPOS_AVAIL = False
+try:
+    from dsr_msgs2.srv import MoveJoint  # 홈('h') 키 — 높은 scout 자세 복귀
+    _MOVEJOINT_AVAIL = True
+except Exception:
+    _MOVEJOINT_AVAIL = False
+try:
+    from dsr_msgs2.srv import MoveLine   # 홈 후 20cm 수직 상승 (depth 범위 위로)
+    _MOVELINE_AVAIL = True
+except Exception:
+    _MOVELINE_AVAIL = False
+
+# GraspGen ZMQ 클라이언트 (object_tracking 워크플로우 이식). ~/GraspGen path 추가.
+_GG_ROOT = os.path.expanduser("~/GraspGen")
+if os.path.isdir(_GG_ROOT) and _GG_ROOT not in sys.path:
+    sys.path.insert(0, _GG_ROOT)
+try:
+    from grasp_gen.serving.zmq_client import GraspGenClient
+    _GRASPGEN_AVAIL = True
+except Exception as _gge:
+    _GRASPGEN_AVAIL = False
+    _GRASPGEN_ERR = str(_gge)
 
 import pyrealsense2 as rs
 
@@ -628,27 +701,18 @@ class WebcamSegNode(Node):
         # 학습 데이터: 30 RealSense frames + GD+SAM2 auto-label. mAP50=0.99, mAP-Mask=0.92.
         # classes: 0=bottle, 1=can, 2=snack_bag, 3=bread  (실측 m.names — 4-class)
         self.declare_parameter('weights', _resolve(
-            '../models/pose_robust_seg.pt', ''))
+            'models/pose_robust_seg.pt', ''))
         # 추가 모델들 (파일 있으면 자동 활성, 없으면 skip)
-        self.declare_parameter('weights_obb', _resolve('../models/yolo26obb_can_pen.pt', ''))
+        self.declare_parameter('weights_obb', _resolve('models/yolo26obb_can_pen.pt', ''))
         # YOLOE 기본 비활성 (false positive 많음). 활성하려면 launch 시 weights_yoloe 지정.
         self.declare_parameter('weights_yoloe', '')
         self.declare_parameter('yoloe_prompts',
                                'green can,red can,coca cola,bottle,cup,pen,marker')
         # GroundingDINO (background, 3초 주기) — 학습 안 한 물체도 자연어로 검출
-        # config 는 groundingdino pip 패키지가 제공 → 패키지 경로 우선 fallback
-        try:
-            import groundingdino as _gd_pkg
-            _gd_cfg_default = os.path.join(os.path.dirname(_gd_pkg.__file__),
-                                           'config', 'GroundingDINO_SwinT_OGC.py')
-        except Exception:
-            _gd_cfg_default = os.path.expanduser(
-                '~/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py')
-        self.declare_parameter('gd_config', _gd_cfg_default)
-        # weights 는 패키지 번들(../models) 우선, 없으면 ~/models fallback
-        self.declare_parameter('gd_weights', _resolve(
-            '../models/groundingdino_swint_ogc.pth',
-            '~/models/groundingdino_swint_ogc.pth'))
+        self.declare_parameter('gd_config',
+                               os.path.expanduser('~/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'))
+        self.declare_parameter('gd_weights',
+                               os.path.expanduser('~/models/groundingdino_swint_ogc.pth'))
         # caption 단순화 — 한 객체에 여러 phrase 매칭 방지 (snack/potato chip 중 하나만)
         # cup 제외 (사용자 요청) — 4클래스 대상(can/bottle/snack)만 검출.
         self.declare_parameter('gd_prompts',
@@ -670,9 +734,11 @@ class WebcamSegNode(Node):
             '브랜드/제품명이 있으면 포함. 예: "초록색 칠성사이다 캔", "농심 포테토칲 봉지". '
             '한국어로만 답변하고 추가 설명은 하지마.')
         self.declare_parameter('calibration_path', _here('calibration_result.npz'))
-        self.declare_parameter('conf', 0.65)   # can recall 우선 (false pos 약간 허용)
+        # conf 0.40 + imgsz 960: 카메라를 depth dead-zone(>~0.5m) 위로 올려 운용하면
+        # 물체가 작아짐 → 작은 물체도 잡게 낮은 conf + 큰 입력. (camera 높이 운용 필수)
+        self.declare_parameter('conf', 0.40)
         self.declare_parameter('iou', 0.5)
-        self.declare_parameter('imgsz', 640)
+        self.declare_parameter('imgsz', 960)
         self.declare_parameter('width', 1280)   # bottle mosaic 해결 위해 1280x720
         self.declare_parameter('height', 720)
         self.declare_parameter('approach_height', 0.08)  # m
@@ -680,7 +746,8 @@ class WebcamSegNode(Node):
 
         weights = self.get_parameter('weights').value
         calib_path = self.get_parameter('calibration_path').value
-        self.conf = float(self.get_parameter('conf').value)
+        self.conf = float(os.environ.get(
+            'WSN_CONF', self.get_parameter('conf').value))
         self.iou = float(self.get_parameter('iou').value)
         self.imgsz = int(self.get_parameter('imgsz').value)
         self.width = int(self.get_parameter('width').value)
@@ -810,13 +877,12 @@ class WebcamSegNode(Node):
                 break
             except Exception as e:
                 self.get_logger().warn(f'HQ-SAM {label} 로드 실패: {e}')
-        # SAM 2 fallback — ISNet(Path B) 가 primary 라 불필요. SAM2 Large(~2.4GB)
-        # 로드는 OOM(code 137) 주원인 → 기본 비활성. ENABLE_SAM2=1 로 재활성.
-        if self.hqsam_predictor is None and os.environ.get('ENABLE_SAM2') == '1':
-            # 패키지 번들(../models) 우선, 없으면 ~/models fallback
-            sam2_large = _resolve('../models/sam2_hiera_large.pt', '~/models/sam2_hiera_large.pt')
-            sam2_small = _resolve('../models/sam2_hiera_small.pt', '~/models/sam2_hiera_small.pt')
-            sam2_tiny = _resolve('../models/sam2_hiera_tiny.pt', '~/models/sam2_hiera_tiny.pt')
+        # SAM 2 — 정밀 외곽선용. 단일 .py 실행만으로 '이전처럼' SAM2 켜지게
+        # 기본 활성(ENABLE_SAM2 기본 '1'). 끄려면 ENABLE_SAM2=0 으로 실행.
+        if self.hqsam_predictor is None and os.environ.get('ENABLE_SAM2', '1') != '0':
+            sam2_large = os.path.expanduser('~/models/sam2_hiera_large.pt')
+            sam2_small = os.path.expanduser('~/models/sam2_hiera_small.pt')
+            sam2_tiny = os.path.expanduser('~/models/sam2_hiera_tiny.pt')
             for ckpt, cfg, label in [
                 (sam2_large, 'configs/sam2/sam2_hiera_l.yaml', 'Large'),
                 (sam2_small, 'configs/sam2/sam2_hiera_s.yaml', 'Small'),
@@ -898,6 +964,15 @@ class WebcamSegNode(Node):
         self.get_logger().info(
             f'  translation (mm) = {np.round(T[:3, 3] * 1000, 1).tolist()}')
 
+        # ── Eye-in-hand 대응: 카메라가 그리퍼에 달려 움직이므로 고정 T_cam2base 는
+        # 캘리브 자세에서만 맞음. eih_fk_publisher 가 FK 로 발행하는 /eih/T_cam2base
+        # 를 구독해 실시간 갱신 (메시지 오면 고정값 대신 그걸 사용; 없으면 fallback).
+        self._eih_active = False
+        self.create_subscription(
+            Float64MultiArray, '/eih/T_cam2base', self._eih_tcam_cb, 10)
+        self.get_logger().info(
+            '  /eih/T_cam2base 구독 — 로봇+eih_fk 떠있으면 실시간 변환(eye-in-hand) 사용')
+
         self.get_logger().info('RealSense 시작...')
         self.pipe = rs.pipeline()
         cfg = rs.config()
@@ -916,10 +991,80 @@ class WebcamSegNode(Node):
             PoseStamped, '/dsr01/curobo/pick_pose', 10)
         self.pub_target = self.create_publisher(
             PoseStamped, '/dsr01/curobo/target_pose', 10)
-        self.cli_open = self.create_client(
-            Trigger, '/dsr01/gripper/open', callback_group=cb_group)
-        self.cli_close = self.create_client(
-            Trigger, '/dsr01/gripper/close', callback_group=cb_group)
+        # 타깃 외 검출물체를 curobo 충돌맵에 장애물로 발행 (피해서 집기)
+        self.pub_obstacles = self.create_publisher(
+            String, '/dsr01/curobo/obstacles', 10)
+        # 그리퍼 열기(PLACE 릴리스) — 브리지 set_position(0). 파지(close)는 curobo 가 safe_grasp.
+        self.cli_open = (self.create_client(
+            SetPosition, '/gripper_service/set_position',
+            callback_group=cb_group) if _SETPOS_AVAIL else None)
+        # 🛑 비상정지 (스페이스바) — 두산 MoveStop(Quick stop). 물리 E-stop 의 보조.
+        self.cli_stop = None
+        if _MOVESTOP_AVAIL:
+            self.cli_stop = self.create_client(
+                MoveStop, '/dsr01/motion/move_stop', callback_group=cb_group)
+        self._estop_last = 0.0
+        # 🏠 홈('h') — 카메라가 depth dead-zone 위로 올라가는 높은 scout 자세 (deg).
+        # 사용자 지정 홈 (깨끗한 config, j4=5 → flip/하늘봄 없음). 아래보기.
+        self.cli_home = None
+        if _MOVEJOINT_AVAIL:
+            self.cli_home = self.create_client(
+                MoveJoint, '/dsr01/motion/move_joint', callback_group=cb_group)
+        self.cli_raise = None
+        if _MOVELINE_AVAIL:
+            self.cli_raise = self.create_client(
+                MoveLine, '/dsr01/motion/move_line', callback_group=cb_group)
+        # 검증된 단일 high 자세 (flip 없음 j4=5, 카메라 736mm 아래봄, 캔 z=+87 정상).
+        # move_line 상승은 손목 flip(카메라 위) 유발 → rise=0, 단일 move_joint 만.
+        _hp = os.environ.get('WSN_HOME', '0.0,-36.0,56.0,5.0,110.0,0.0')
+        self.home_pose = [float(v) for v in _hp.split(',')]
+        self.home_rise_mm = float(os.environ.get('WSN_HOME_RISE_MM', '0'))
+        self._home_last = 0.0
+
+        # ── object_tracking 식 워크플로우 (1-9 lock + g/s/p) ──
+        self.grasp_pose_pub = self.create_publisher(
+            PoseStamped, '/dsr01/curobo/grasp_pose', 10)
+        self.marker_pub = self.create_publisher(
+            Marker, '/graspgen/preview_marker', 10)
+        self.detections = []          # 매 프레임 검출 [{name,center_base,mask,cloud_m,bbox}]
+        self.selected_idx = 0
+        self.locked = False
+        self.locked_idx = None
+        self._det_track = {}          # 트랙키(base XY grid) → {det, t} : 깜빡임 방지 지속성
+        self.locked_tk = None         # 잠긴 물체의 트랙키 (인덱스 대신 위치로 추종)
+        self.pending_grasp_pose = None  # (pos_m[3], quat_xyzw[4], approach[3]) or None
+        # p 전진거리(m): 카메라↔그리퍼끝 차이 보정 = 접근축 방향 12cm 전진.
+        # 실로봇에서 실제 차이에 맞게 조정 (부호 반대면 음수).
+        self.approach_advance = 0.12
+        # 그리퍼 밑동(curobo ee_link=gripper_rh_p12_rn_base) → 손가락 grasp center 거리.
+        # GraspGen 파지점은 손가락 사이(grasp center)이므로, 그리퍼 밑동 목표 =
+        # 파지점 − gripper_len×approach (뒤로 물려야 손가락이 파지점에 닿음).
+        # 그랩 기하 — pos(GraspGen 그리퍼원점, 물체 위쪽) 기준, approach 는 물체 쪽(아래).
+        #   s(프리그래스프) = pos - standoff*approach  (approach 반대=뒤/위로 물러남)
+        #   p(집기)        = pos + advance *approach  (approach 방향=물체로 전진/하강)
+        # 화살표 s→p 는 항상 +approach(물체 방향). advance 로 깊이 조절(12cm).
+        # 캔중심(C) 기준 모델 (노이즈 심한 GraspGen pos 대신 안정적 검출중심 사용):
+        #   p(집기,그리퍼밑동) = C - gripper_offset*approach  (손가락이 C 에 닿음)
+        #   s(프리그래스프)    = C - (gripper_offset+standoff)*approach
+        self.gripper_offset = 0.11     # 그리퍼 밑동→손가락 (13→11, p 2cm 더 전진)
+        self.pregrasp_standoff = 0.06  # 's' 추가 후퇴량
+        # 잡는 높이(base z, m) 고정 — 검출 z 가 노이즈로 흔들리는 대신 항상 같은 높이.
+        # 바닥(테이블)≈-30mm 기준. 기본 +50mm(바닥서 ~8cm). 'auto'면 검출 z 사용.
+        # 도달성: 너무 낮으면 수평 그랩 불가 → 60~120mm 권장.
+        _gfz = os.environ.get('WSN_GRASP_FIXED_Z', '57.5')
+        self.grasp_fixed_z = (None if _gfz in ('auto', 'off', '')
+                              else float(_gfz) / 1000.0)
+        # GraspGen 클라이언트 (서버 :5556). 없으면 None 으로 두고 g 키에서 경고.
+        self.gg = None
+        if _GRASPGEN_AVAIL:
+            try:
+                self.gg = GraspGenClient('localhost', 5556,
+                                         timeout_ms=60000, wait_for_server=False)
+                self.get_logger().info('GraspGen 클라이언트 준비 (:5556)')
+            except Exception as e:
+                self.get_logger().warn(f'GraspGen 클라이언트 init 실패: {e}')
+        else:
+            self.get_logger().warn(f'GraspGen 모듈 없음: {_GRASPGEN_ERR}')
 
         # 빨간 외곽선 = fine-tuned YOLO seg mask polygon (학습된 정확한 모양, ms 단위).
         # 'm' 키 토글: True = ISNet+GrabCut 추가 정밀화 (느림). False = YOLO seg 만 (빠름).
@@ -969,8 +1114,88 @@ class WebcamSegNode(Node):
         c = c.lower()
         return HANGUL_TO_EN.get(c, c)
 
+    def _emergency_stop(self):
+        """🛑 스페이스바 비상정지 — 두산 MoveStop(Quick stop). 디바운스 0.3s.
+        ※ 물리 E-stop(TP 빨간버튼)이 1순위. 이건 소프트 보조."""
+        now_ = time.time()
+        if now_ - self._estop_last < 0.3:
+            return
+        self._estop_last = now_
+        if self.cli_stop is None:
+            self.get_logger().error('🛑 비상정지 서비스 없음 (dsr_msgs2/MoveStop) — 물리 E-stop 사용!')
+            return
+        try:
+            req = MoveStop.Request()
+            req.stop_mode = 1   # DR_QSTOP : Quick stop
+            self.cli_stop.call_async(req)
+            self.get_logger().warn('🛑🛑🛑 [SPACE] 비상정지 — MoveStop(QSTOP) 호출됨')
+        except Exception as e:
+            self.get_logger().error(f'🛑 비상정지 호출 실패: {e} — 물리 E-stop 사용!')
+
+    def _go_home(self):
+        """🏠 'h' 키 — 높은 scout 자세(카메라가 depth 범위 위)로 복귀. 디바운스 1s."""
+        now_ = time.time()
+        if now_ - self._home_last < 1.0:
+            return
+        self._home_last = now_
+        if self.cli_home is None:
+            self.get_logger().error('🏠 홈 서비스 없음 (dsr_msgs2/MoveJoint)')
+            return
+        if not self.cli_home.service_is_ready():
+            if not self.cli_home.wait_for_service(timeout_sec=0.5):
+                self.get_logger().error('🏠 move_joint 서비스 미연결 — 브링업 확인')
+                return
+        try:
+            req = MoveJoint.Request()
+            req.pos = [float(v) for v in self.home_pose]
+            req.vel = 30.0
+            req.acc = 30.0
+            req.time = 0.0
+            req.radius = 0.0
+            req.mode = 0       # ABSOLUTE
+            req.blend_type = 0
+            req.sync_type = 0  # SYNC — 응답=모션 완료 → 그 다음 상승 체이닝
+            fut = self.cli_home.call_async(req)
+
+            def _then_rise(f):
+                # 홈 도달 후 수직 +상승 (depth 범위 위로). move_line REL base Z.
+                try:
+                    ok = getattr(f.result(), 'success', True)
+                except Exception as ex:
+                    self.get_logger().error(f"🏠 홈 응답 에러: {ex}"); ok = False
+                if not ok or self.cli_raise is None or self.home_rise_mm <= 0:
+                    self.get_logger().info(f"🏠 홈 도달 (단일 자세, 상승 없음)"); return
+                try:
+                    lr = MoveLine.Request()
+                    lr.pos = [0.0, 0.0, float(self.home_rise_mm), 0.0, 0.0, 0.0]
+                    lr.vel = [60.0, 30.0]; lr.acc = [120.0, 60.0]
+                    lr.time = 0.0; lr.radius = 0.0
+                    lr.ref = 0          # DR_BASE
+                    lr.mode = 1         # RELATIVE
+                    lr.blend_type = 0; lr.sync_type = 1
+                    self.cli_raise.call_async(lr)
+                    self.get_logger().info(
+                        f"🏠 홈 도달 → +{self.home_rise_mm:.0f}mm 수직 상승")
+                except Exception as ex:
+                    self.get_logger().error(f"🏠 상승 실패: {ex}")
+            fut.add_done_callback(_then_rise)
+            self.get_logger().info(
+                f"🏠 [h] 홈 이동 → {[round(v,1) for v in self.home_pose]}° "
+                f"(도달 후 +{self.home_rise_mm:.0f}mm 상승)")
+        except Exception as e:
+            self.get_logger().error(f'🏠 홈 이동 실패: {e}')
+
     def _on_key_press(self, key):
+        # 스페이스바 = 비상정지 (OS레벨 — 창 포커스 무관하게 즉시 작동)
+        try:
+            if key == pynput_keyboard.Key.space:
+                self._emergency_stop()
+                return
+        except Exception:
+            pass
         c = self._normalize(key)
+        # ('h' 홈은 cv2.waitKey 핸들러에서만 처리 — 여기서 또 하면 move_joint 이중발사
+        #  → 충돌로 로봇이 엉뚱한 자세(하늘)로 감. OS레벨 중복 금지.)
         if not c:
             return
         self.keys_held.add(c)
@@ -1592,6 +1817,342 @@ class WebcamSegNode(Node):
             self.gd_busy = False
 
     # ---------- 좌표 변환 ----------
+    def _eih_tcam_cb(self, msg):
+        """eih_fk_publisher 의 /eih/T_cam2base (Float64MultiArray 16) → 실시간 T_cam2base.
+        eye-in-hand: 카메라가 그리퍼에 달려 움직이므로 FK 로 매 순간 갱신된 변환 사용.
+        참조 교체는 GIL 하 원자적이라 별도 lock 불필요 (spin_camera 가 읽음)."""
+        if len(msg.data) >= 16:
+            self.T_cam2base = np.array(msg.data[:16], dtype=float).reshape(4, 4)
+            if not self._eih_active:
+                self._eih_active = True
+                self.get_logger().info(
+                    '[eih] /eih/T_cam2base 수신 시작 — 실시간 eye-in-hand 변환으로 전환')
+
+    # ---------- object_tracking 식 GraspGen 워크플로우 (1-9 lock + g/s/p) ----------
+    def _selected(self):
+        """현재 lock된 검출 dict (트랙키 기준, 없으면 None)."""
+        if self.locked and self.locked_tk is not None:
+            for d in self.detections:
+                if d.get('_tk') == self.locked_tk:
+                    return d
+            return None
+        return self.detections[0] if self.detections else None
+
+    def send_graspgen(self):
+        """'g' 키: 선택 물체 cloud(base,m) → GraspGen → best 6DOF 파지(오프셋 없는 '파지점').
+        pending=(파지점pos, quat, 접근축) 저장 + RViz 미리보기 (로봇 안 움직임).
+        's'=파지점으로 이동, 'p'=12cm 전진+집기, 'r'=취소."""
+        det = self._selected()
+        if det is None:
+            self.get_logger().warn('선택 물체 없음 (1-9 로 lock)'); return
+        if self.gg is None:
+            self.get_logger().warn('GraspGen 클라이언트 없음 (서버 :5556 확인)'); return
+        cloud = det.get('cloud_m')
+        if cloud is None or len(cloud) < 50:
+            self.get_logger().warn('포인트클라우드 부족'); return
+        cloud = np.asarray(cloud, dtype=np.float32)
+        center = cloud.mean(axis=0)
+        pc = (cloud - center).astype(np.float32)   # 중심정규화 후 추론
+        try:
+            grasps, confs = self.gg.infer(pc)
+        except Exception as e:
+            self.get_logger().error(f'GraspGen infer 실패: {e}'); return
+        if grasps is None or len(grasps) == 0:
+            self.get_logger().warn('GraspGen: 파지 0개'); return
+        grasps = np.asarray(grasps, dtype=float); confs = np.asarray(confs, dtype=float)
+        # ── 파지 선택. 캔/병(원통)은 옆면 수평 파지 — approach 가 XY평면에 평행
+        # (base z 성분 az≈0)인 것 우선. 그 외(스낵 등)는 conf 최고.
+        _ggl = det.get('gg_label')
+        az = grasps[:, 2, 2]   # 각 grasp approach(Z열)의 base z 성분 (0=수평, ±1=수직)
+        # ── 접근 방위각 제한: 기준방향 ±range 안의 grasp만 (반대쪽/뒤 접근 제외).
+        # 기준 기본 = radial(베이스→물체). WSN_GRASP_AZ_REF(deg)로 고정, RANGE(기본90).
+        _cxy = np.asarray(det.get('center_base'), dtype=float)[:2]
+        _refdeg = os.environ.get('WSN_GRASP_AZ_REF', '')
+        if _refdeg not in ('', 'auto'):
+            _rr = np.radians(float(_refdeg)); _ref = np.array([np.cos(_rr), np.sin(_rr)])
+        elif np.linalg.norm(_cxy) > 0.05:
+            _ref = _cxy / np.linalg.norm(_cxy)
+        else:
+            _ref = None
+        _azok = np.ones(len(grasps), dtype=bool)
+        if _ref is not None:
+            _axy = grasps[:, :2, 2]
+            _nn = np.linalg.norm(_axy, axis=1) + 1e-9
+            _dotr = (_axy[:, 0]*_ref[0] + _axy[:, 1]*_ref[1]) / _nn
+            _azok = _dotr >= np.cos(np.radians(
+                float(os.environ.get('WSN_GRASP_AZ_RANGE', '90'))))
+        if _ggl in ('can', 'pet_bottle'):
+            # 방위 OK + 수평-ish(|az|<0.45) 중 conf 최고. 없으면 단계적 완화.
+            _ok = np.where((np.abs(az) < 0.45) & _azok)[0]
+            if _ok.size == 0:
+                _ok = np.where(_azok)[0]
+            if _ok.size == 0:
+                _ok = np.arange(len(grasps))
+            best = int(_ok[np.argmax(confs[_ok])])
+            self.get_logger().info(
+                f"[g] {_ggl} 옆면 파지: az={az[best]:+.2f} conf={confs[best]:.2f} "
+                f"(방위±{os.environ.get('WSN_GRASP_AZ_RANGE','90')}° OK {int(_azok.sum())}/{len(grasps)})")
+        else:
+            _ok = np.where(_azok)[0]
+            best = int(_ok[np.argmax(confs[_ok])]) if _ok.size else int(np.argmax(confs))
+        T = grasps[best].copy()
+        T[:3, 3] += center                      # 중심정규화 복원 (base frame, m)
+        pos = T[:3, 3].copy()                    # GraspGen 파지점 (오프셋 X)
+        approach = T[:3, 2]; approach = approach / (np.linalg.norm(approach) + 1e-9)
+        R_grasp = T[:3, :3].copy()
+        # 캔/병 옆면 파지: 그리퍼를 XY평면에 평행(수평)하게 강제.
+        #   approach 의 수직성분 제거 → 완전 수평 접근축. 핑거축도 수평(XY평면).
+        #   binormal = 수직(world +Z). → 그리퍼 전체가 XY평면에 평평하게 누움.
+        # (WSN_LEVEL_GRASP=0 으로 off, 핑거축 90° 어긋나면 WSN_LEVEL_SWAP=1)
+        if (_ggl in ('can', 'pet_bottle')
+                and os.environ.get('WSN_LEVEL_GRASP', '1') != '0'):
+            # 방위각: 캔/병은 원통이라 어느 방향서 잡아도 됨 → 베이스→물체 직선(radial)
+            # 방향으로 고정. GraspGen 의 45° 대각 방위 제거 + 손목 회전(spin) 최소화.
+            # (WSN_RADIAL_APPROACH=0 이면 GraspGen 방위 투영 사용)
+            _Cxy = np.asarray(det.get('center_base'), dtype=float)[:2]
+            if (os.environ.get('WSN_RADIAL_APPROACH', '0') != '0'   # 기본 OFF (g 마다 방향 다양)
+                    and np.linalg.norm(_Cxy) > 0.05):
+                a_h = np.array([_Cxy[0], _Cxy[1], 0.0])       # radial (베이스→물체)
+            else:
+                a_h = np.array([approach[0], approach[1], 0.0])  # GraspGen 방위 투영
+            n = np.linalg.norm(a_h)
+            if n > 1e-3:
+                approach = a_h / n                            # 완전 수평 접근축
+                up = np.array([0.0, 0.0, 1.0])
+                x = np.cross(up, approach); x /= (np.linalg.norm(x) + 1e-9)  # 수평 핑거축
+                y = np.cross(approach, x); y /= (np.linalg.norm(y) + 1e-9)   # 수직 binormal
+                if os.environ.get('WSN_LEVEL_SWAP', '1') != '0':   # 기본 swap ON
+                    x, y = y, -x                                   # 핑거축 90° (RH-P12 보정)
+                R_grasp = np.column_stack([x, y, approach])
+        quat = _rotm_to_quat(R_grasp)
+        # 앵커 = 안정적인 캔 검출 중심 C (GraspGen pos 는 노이즈 심해 안 씀).
+        C = np.asarray(det.get('center_base'), dtype=float)
+        if self.grasp_fixed_z is not None:
+            C[2] = self.grasp_fixed_z   # 잡는 높이 고정 (검출 z 무시)
+        # pending = (캔중심 C, quat, approach) — s/p 모두 C 기준으로 계산.
+        self.pending_grasp_pose = (C, np.asarray(quat), np.asarray(approach))
+        self.publish_grasp_marker(C, quat, action=Marker.ADD)
+        _pt = C - self.gripper_offset * np.asarray(approach)   # p 그리퍼밑동 타겟
+        _cb = np.asarray(det.get('center_base', [0, 0, 0])) * 1000.0  # 캔 검출 중심(mm)
+        self.get_logger().info(
+            f"[g] {det['name']} conf={float(confs[best]):.3f} "
+            f"캔중심=({_cb[0]:.0f},{_cb[1]:.0f},{_cb[2]:.0f}) "
+            f"pos=({pos[0]*1000:.0f},{pos[1]*1000:.0f},{pos[2]*1000:.0f})mm "
+            f"approach=({approach[0]:+.2f},{approach[1]:+.2f},{approach[2]:+.2f}) "
+            f"[az<0=아래로] p타겟(밑동)=({_pt[0]*1000:.0f},{_pt[1]*1000:.0f},{_pt[2]*1000:.0f})mm "
+            f"오프셋={self.gripper_offset*100:.0f}cm")
+
+    def _depth_obstacles(self, exclude_xy=None, exclude_r=0.07):
+        """분류기(YOLO/GD)가 못 잡아도 depth 클라우드로 '테이블 위 모든 물체'를
+        클러스터링해 장애물 박스로 반환. top-down 홈뷰에서 seg 가 0개여도 동작.
+        exclude_xy(m): 타깃 중심 — 그 반경(exclude_r m) 안 점은 제외(잡을 물체)."""
+        depth_arr = getattr(self, '_last_depth', None)
+        if depth_arr is None or self.T_cam2base is None \
+                or getattr(self, 'intr', None) is None:
+            return []
+        H, W = depth_arr.shape
+        step = max(1, W // 140)                       # ~140px 가로 해상도(촘촘)
+        sub = depth_arr[::step, ::step].astype(np.float32) * 0.001   # m
+        vv, uu = np.mgrid[0:H:step, 0:W:step]
+        m = (sub > 0.1) & (sub < 1.2)
+        if int(m.sum()) < 30:
+            return []
+        Z = sub[m]; U = uu[m].astype(np.float32); V = vv[m].astype(np.float32)
+        fx, fy = self.intr.fx, self.intr.fy
+        cx, cy = self.intr.ppx, self.intr.ppy
+        X = (U - cx) / fx * Z; Y = (V - cy) / fy * Z
+        cam = np.stack([X, Y, Z, np.ones_like(Z)], axis=0)
+        base = (self.T_cam2base @ cam)[:3].T * 1000.0   # mm, Nx3
+        bx, by, bz = base[:, 0], base[:, 1], base[:, 2]
+        # 장애물 후보 영역 — 작업영역보다 좁게(가장자리 펑보드/뒷판 배경 배제).
+        # env 로 조정 가능(WSN_OBS_X/Y).
+        XMIN = float(os.environ.get('WSN_OBS_XMIN', '300'))
+        XMAX = float(os.environ.get('WSN_OBS_XMAX', '750'))
+        YMIN = float(os.environ.get('WSN_OBS_YMIN', '-450'))
+        YMAX = float(os.environ.get('WSN_OBS_YMAX', '550'))
+        TABLE = -30.                                       # 테이블 base z(mm)
+        keep = ((bx > XMIN) & (bx < XMAX) & (by > YMIN) & (by < YMAX)
+                & (bz > TABLE + 40.) & (bz < 350.))        # 테이블 위 4cm~35cm
+        bx, by, bz = bx[keep], by[keep], bz[keep]
+        pu, pv = U[keep], V[keep]                          # 원본 픽셀(시각화용)
+        if bx.size < 20:
+            return []
+        if exclude_xy is not None:
+            far = ((bx - exclude_xy[0] * 1000.) ** 2
+                   + (by - exclude_xy[1] * 1000.) ** 2) > (exclude_r * 1000.) ** 2
+            bx, by, bz = bx[far], by[far], bz[far]
+            pu, pv = pu[far], pv[far]
+        if bx.size < 12:
+            return []
+        # 2cm XY 점유격자 → 연결요소 클러스터
+        res = 20.0
+        GW = int((XMAX - XMIN) / res) + 1
+        GH = int((YMAX - YMIN) / res) + 1
+        gx = np.clip(((bx - XMIN) / res).astype(int), 0, GW - 1)
+        gy = np.clip(((by - YMIN) / res).astype(int), 0, GH - 1)
+        occ = np.zeros((GH, GW), np.uint8)
+        occ[gy, gx] = 255
+        occ = cv2.dilate(occ, np.ones((3, 3), np.uint8), iterations=1)
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(occ, 8)
+        labels_pt = lab[gy, gx]
+        obs = []
+        for i in range(1, n):
+            if stats[i, cv2.CC_STAT_AREA] < 2:           # 노이즈 셀
+                continue
+            sel = labels_pt == i
+            if int(sel.sum()) < 5:
+                continue
+            ox, oy, oz = bx[sel], by[sel], bz[sel]
+            su, sv = pu[sel], pv[sel]
+            # 5~95 백분위로 stray 점 제거(박스 풍선현상 방지)
+            x5, x95 = np.percentile(ox, [5, 95])
+            y5, y95 = np.percentile(oy, [5, 95])
+            top = float(np.percentile(oz, 95))
+            if top < TABLE + 30.:          # 테이블보다 3cm 미만 = 바닥 노이즈, 물체 아님
+                continue
+            cxm = float(np.median(ox)) / 1000.; cym = float(np.median(oy)) / 1000.
+            _w0 = float(x95 - x5); _d0 = float(y95 - y5)
+            # 벽/판 배제: 한 변이 25cm 넘거나 종횡비 3:1 넘는 길쭉한 면 = 물체 아님
+            _lo = max(min(_w0, _d0), 1.0); _hi = max(_w0, _d0)
+            if _hi > 250. or _hi / _lo > 3.0:
+                continue
+            wmm = min(max(_w0 + 30., 40.), 250.)
+            dmm = min(max(_d0 + 30., 40.), 250.)
+            hmm = min(max(top - TABLE, 40.), 400.)        # 테이블~top 까지 채움
+            obs.append({'name': 'obj',
+                        'pos': [cxm, cym, ((top + TABLE) / 2.) / 1000.],
+                        'dims': [wmm / 1000., dmm / 1000., hmm / 1000.],
+                        'px_bbox': (int(np.percentile(su, 5)),
+                                    int(np.percentile(sv, 5)),
+                                    int(np.percentile(su, 95)),
+                                    int(np.percentile(sv, 95)))})
+        return obs
+
+    def _publish_obstacles(self, exclude_det, log=True):
+        """타깃(exclude_det) 제외한 물체를 curobo 장애물로 발행.
+        seg 검출(self.detections) + depth 클러스터(분류 무관) 합집합 → 누락 최소화."""
+        import json as _json
+        obs = []
+        ex_tk = exclude_det.get('_tk') if exclude_det else None
+        ex_c = exclude_det.get('center_base') if exclude_det else None
+        for d in self.detections:
+            if ex_tk is not None and d.get('_tk') == ex_tk:
+                continue                       # 타깃 제외 (잡을 물체는 장애물 아님)
+            c = d.get('center_base')
+            if c is None:
+                continue
+            cloud = d.get('cloud_m')
+            if cloud is not None and len(cloud) >= 10:
+                cl = np.asarray(cloud, dtype=float)
+                dims = (cl.max(axis=0) - cl.min(axis=0)) + 0.03   # 3cm 여유
+                dims = np.clip(dims, 0.04, 0.30)
+            else:
+                dims = np.array([0.08, 0.08, 0.15])
+            obs.append({'name': str(d.get('name', 'obj')),
+                        'pos': [float(c[0]), float(c[1]), float(c[2])],
+                        'dims': [float(dims[0]), float(dims[1]), float(dims[2])]})
+        # depth 클러스터 장애물 — seg 가 못 잡는 물체 보강. 단 펑보드/top-down 등
+        # 노이즈 환경에선 거짓 장애물이 curobo plan 을 방해할 수 있어 기본 OFF.
+        # 켜려면 WSN_DEPTH_OBS=1. (화면 빨간 OBS 시각화는 항상 ON, curobo 발행만 게이트)
+        if os.environ.get('WSN_DEPTH_OBS', '0') != '0':
+            _ex_xy = (float(ex_c[0]), float(ex_c[1])) if ex_c is not None else None
+            for dob in self._depth_obstacles(exclude_xy=_ex_xy):
+                _p = dob['pos']
+                _dup = any((_p[0] - o['pos'][0]) ** 2 + (_p[1] - o['pos'][1]) ** 2
+                           < 0.08 ** 2 for o in obs)
+                if not _dup:
+                    obs.append(dob)
+        m = String(); m.data = _json.dumps(obs)
+        self.pub_obstacles.publish(m)
+        if log:
+            self.get_logger().info(
+                f"[obstacles] 장애물 {len(obs)}개 발행 (seg+depth, 타깃 제외)")
+
+    def move_to_grasp(self):
+        """'s' 키: GraspGen 파지점으로 '이동만' (그리퍼 안 닫음).
+        /dsr01/curobo/target_pose 발행 → curobo 가 그 자세로 이동. pending 유지(p 용)."""
+        if self.pending_grasp_pose is None:
+            return False
+        C, quat, approach = self.pending_grasp_pose   # C=캔중심
+        # 타깃 외 물체 장애물 발행 → curobo world 갱신 대기 후 target 발행
+        self._publish_obstacles(self._selected())
+        time.sleep(0.3)
+        # 프리그래스프 = 캔중심에서 (그리퍼길이+standoff) 만큼 approach 반대로 뒤.
+        pre = (np.asarray(C)
+               - (self.gripper_offset + self.pregrasp_standoff) * np.asarray(approach))
+        msg = self._pose_msg(pre, quat)
+        self.pub_target.publish(msg)          # 이동 전용 토픽
+        self.get_logger().info(
+            f"[s] 프리그래스프(캔중심-{(self.gripper_offset+self.pregrasp_standoff)*100:.0f}cm·approach) "
+            f"→ ({pre[0]*1000:.0f},{pre[1]*1000:.0f},{pre[2]*1000:.0f})mm "
+            f"[캔중심 {C[0]*1000:.0f},{C[1]*1000:.0f},{C[2]*1000:.0f}]")
+        return True
+
+    def advance_and_grip(self):
+        """'p' 키: 파지점에서 접근축 방향으로 12cm 전진(카메라↔그리퍼끝 보정) + 집기 + 15cm 수직 lift.
+        (파지점+12cm) 를 /dsr01/curobo/pick_pose 발행 → curobo: descend→close→lift."""
+        if self.pending_grasp_pose is None:
+            self.get_logger().warn("[p] 대기 파지 없음 — 'g' 먼저"); return False
+        C, quat, approach = self.pending_grasp_pose   # C=캔중심
+        # 타깃 외 물체 장애물 발행 → curobo world 갱신 대기 후 pick 발행
+        self._publish_obstacles(self._selected())
+        time.sleep(0.3)
+        # 집기: 그리퍼밑동 = 캔중심 - 그리퍼길이*approach (손가락이 캔중심에 닿음).
+        adv = np.asarray(C) - self.gripper_offset * np.asarray(approach)
+        msg = self._pose_msg(adv, quat)
+        self.pub_pick.publish(msg)            # pick_pose_cb: open→descend→close→lift(15cm 수직)
+        self.grasp_pose_pub.publish(msg)
+        self.get_logger().info(
+            f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach) → /dsr01/curobo/pick_pose "
+            f"({adv[0]*1000:.0f},{adv[1]*1000:.0f},{adv[2]*1000:.0f})mm (이후 15cm 수직 lift)")
+        self.clear_grasp_preview()
+        return True
+
+    def _pose_msg(self, pos, quat):
+        msg = PoseStamped()
+        msg.header.frame_id = 'base_link'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = float(pos[0]); msg.pose.position.y = float(pos[1])
+        msg.pose.position.z = float(pos[2])
+        msg.pose.orientation.x = float(quat[0]); msg.pose.orientation.y = float(quat[1])
+        msg.pose.orientation.z = float(quat[2]); msg.pose.orientation.w = float(quat[3])
+        return msg
+
+    def clear_grasp_preview(self):
+        if self.pending_grasp_pose is None:
+            return False
+        self.pending_grasp_pose = None
+        self.publish_grasp_marker(None, None, action=Marker.DELETE)
+        return True
+
+    def publish_grasp_marker(self, C, quat_xyzw, action=Marker.ADD):
+        """RViz ARROW: 그리퍼 접근 경로 → 캔중심(C). 꼬리=프리그래스프, 머리=캔중심."""
+        m = Marker()
+        m.header.frame_id = 'base_link'; m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = 'graspgen_preview'; m.id = 0; m.type = Marker.ARROW; m.action = action
+        if action == Marker.ADD:
+            rot = self._quat_to_rotm(quat_xyzw)
+            approach = rot[:, 2]
+            # 캔중심(C)을 향한 화살표: 꼬리=프리그래스프(밑동-standoff 뒤), 머리=캔중심.
+            C = np.asarray(C)
+            start = C - (self.gripper_offset + self.pregrasp_standoff) * approach  # s
+            end = C                                                                # 캔중심
+            m.points = [
+                Point(x=float(start[0]), y=float(start[1]), z=float(start[2])),
+                Point(x=float(end[0]), y=float(end[1]), z=float(end[2]))]
+            m.scale.x = 0.012; m.scale.y = 0.025; m.scale.z = 0.0
+            m.color.r = 0.0; m.color.g = 1.0; m.color.b = 0.2; m.color.a = 0.9
+            m.lifetime.sec = 0
+        self.marker_pub.publish(m)
+
+    @staticmethod
+    def _quat_to_rotm(q):
+        x, y, z, w = q
+        return np.array([
+            [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+            [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+            [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]])
+
     def pixel_to_base_xyz(self, u, v, depth_arr, window=15, forced_depth=None):
         H, W = depth_arr.shape
         u, v = int(u), int(v)
@@ -1606,7 +2167,10 @@ class WebcamSegNode(Node):
             valid = patch[patch > 0]
             if valid.size < 5:
                 return None, f'depth hole ({valid.size}/{patch.size})'
-            z_m = float(np.median(valid)) * 0.001
+            # 금속/반사 물체는 윗면 depth 구멍 → 유효값이 옆면·테이블·먼배경에
+            # 쏠려 median 이 '먼 쪽'으로 편향(카메라 아래보면 z 과음수). 가까운
+            # 표면(물체 자신)으로 편향되게 25분위 사용 (mask_to_base_xyz 와 통일).
+            z_m = float(np.percentile(valid, 25)) * 0.001
             if z_m <= 0.05:
                 return None, f'too close (z={z_m*1000:.0f}mm)'
         cam = rs.rs2_deproject_pixel_to_point(self.intr, [float(u), float(v)], z_m)
@@ -1630,6 +2194,43 @@ class WebcamSegNode(Node):
         p = np.array([cam[0], cam[1], cam[2], 1.0])
         base_m = self.T_cam2base @ p
         return float(cu), float(cv), base_m[:3] * 1000.0    # mm
+
+    def _in_work_zone(self, base_xyz):
+        """검출의 base 좌표(mm)가 작업 가능 영역 안인지 판정.
+        밖이면 배경/먼 물체(사람·모니터·로봇베이스 등 false positive)로 보고
+        검출을 통째로 버린다. 범위는 WSN_ZONE_* env 로 조정 가능.
+        실측 작업물체 범위(x 347~637, y -230~460, z -87~215mm) + 마진."""
+        if base_xyz is None:
+            return False
+        try:
+            x, y, z = float(base_xyz[0]), float(base_xyz[1]), float(base_xyz[2])
+        except Exception:
+            return False
+
+        def _e(name, default):
+            try:
+                return float(os.environ.get(name, default))
+            except Exception:
+                return default
+        xmin = _e('WSN_ZONE_XMIN', 150.0);  xmax = _e('WSN_ZONE_XMAX', 850.0)
+        ymin = _e('WSN_ZONE_YMIN', -550.0); ymax = _e('WSN_ZONE_YMAX', 650.0)
+        zmin = _e('WSN_ZONE_ZMIN', -450.0); zmax = _e('WSN_ZONE_ZMAX', 450.0)
+        return (xmin <= x <= xmax and ymin <= y <= ymax and zmin <= z <= zmax)
+
+    def _is_gray_nonsnack(self, frame_bgr, mask_uint8):
+        """마스크 영역이 회색/저채도(로봇베이스 등)면 True → snack 오검출로 보고 억제.
+        과자봉지=컬러풀(채도≥~49), 로봇베이스=회색(채도~26). 임계 WSN_SNACK_SAT(기본42).
+        실측: snack sat min 48.9 / 회색물체 sat mean 26.5."""
+        try:
+            ys, xs = np.where(mask_uint8 > 0)
+            if xs.size < 30:
+                return False
+            hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+            msat = float(hsv[ys, xs, 1].mean())
+            thr = float(os.environ.get('WSN_SNACK_SAT', '42'))
+            return msat < thr
+        except Exception:
+            return False
 
     def mask_to_base_cloud(self, mask_uint8, depth_arr, max_pts=500,
                            return_pix=False):
@@ -2003,6 +2604,15 @@ class WebcamSegNode(Node):
         refined = self._refine_object_mask(
             frame, base_mask_full, bbox, depth_arr, use_isnet=True,
             block=False, cname=cname)
+        # 작업영역 게이트 — base 좌표가 작업 범위 밖(사람·모니터·배경)이면
+        # GD-only 객체도 외곽선·라벨·dict 전부 skip.
+        _gate = self.mask_to_base_xyz((refined > 0).astype(np.uint8), depth_arr)
+        if _gate is None or not self._in_work_zone(_gate[2]):
+            return
+        # snack 채도 필터 — snack_bag 인데 회색/저채도(로봇베이스)면 오검출 → skip
+        if (str(cname) == 'snack_bag'
+                and self._is_gray_nonsnack(frame, (refined > 0).astype(np.uint8))):
+            return
         cnts, _ = cv2.findContours(refined, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_NONE)
         if os.environ.get('DEBUG_CAN'):
@@ -2157,6 +2767,25 @@ class WebcamSegNode(Node):
         msg.pose.orientation.w = 0.0
         return msg
 
+    def _gripper_open_call(self, label='place/open', position=0):
+        """그리퍼 열기 — 브리지 set_position(0). fire-and-forget(UI 비블록)."""
+        client = self.cli_open
+        if client is None:
+            self.get_logger().warn(f'[{label}] set_position 미가용 (브리지 소스 안됨)')
+            return False
+        if not client.service_is_ready():
+            self.get_logger().warn(f'[{label}] set_position service not ready')
+            return False
+        req = SetPosition.Request()
+        req.position = int(position)
+        req.timeout_sec = 3.0
+        future = client.call_async(req)
+        future.add_done_callback(
+            lambda f: self.get_logger().info(
+                f'[{label}] set_position resp: '
+                f'{f.result().success if f.result() else "?"}'))
+        return True
+
     def _trigger_call(self, client, label):
         if not client.service_is_ready():
             self.get_logger().warn(f'[{label}] service not ready')
@@ -2202,7 +2831,7 @@ class WebcamSegNode(Node):
                 f'{msg.pose.position.z:.3f}) m → 도착 후 gripper open')
             self.pub_target.publish(msg)
             time.sleep(2.0)  # 이동 시간 대충 대기
-            self._trigger_call(self.cli_open, 'place/open')
+            self._gripper_open_call('place/open')
         finally:
             self.motion_lock.release()
 
@@ -2222,7 +2851,34 @@ class WebcamSegNode(Node):
                 if not cf or not df:
                     continue
                 frame = np.asanyarray(cf.get_data())
-                depth_arr = np.asanyarray(df.get_data())
+                depth_arr = np.asanyarray(df.get_data()).copy()
+                # 🛑 [좌표 정확도] depth garbage 컷 — RealSense 가 무효 픽셀을 65535mm
+                # (=65m, uint16 overflow) 나 먼 배경(벽/메시 너머)으로 내보냄. 이게
+                # cloud 에 섞이면 점이 수십 m 밖으로 날아가 centroid·파지점이 박살남
+                # (파지점 454→787 점프 원인). 작업범위(기본 1.2m) 초과는 전부 0(무효).
+                _dmax = float(os.environ.get('WSN_DEPTH_MAX_MM', '850'))
+                depth_arr[depth_arr > _dmax] = 0
+                self._last_depth = depth_arr   # 장애물 depth 클러스터링용
+
+                # ── [좌표 정확도 디버그] 화면 중앙 픽셀(거의 카메라 바로 아래) 을
+                # deproject → 카메라위치와 비교. 정확하면 z≈테이블(-30), xy≈카메라xy.
+                self._dbg_n = getattr(self, '_dbg_n', 0) + 1
+                if os.environ.get('DBG_COORD') and self._dbg_n % 30 == 0:
+                    H0, W0 = depth_arr.shape
+                    cpos = self.T_cam2base[:3, 3] * 1000.0
+                    cd = int(depth_arr[H0 // 2, W0 // 2])
+                    bc, _e = self.pixel_to_base_xyz(W0 // 2, H0 // 2, depth_arr, window=9)
+                    bc_s = ('(%.0f,%.0f,%.0f)' % tuple(bc)) if bc is not None else f'fail({_e})'
+                    _valid = depth_arr[depth_arr > 0]
+                    _frac = 100.0 * _valid.size / depth_arr.size
+                    if _valid.size > 0:
+                        _dstat = (f'유효{_frac:.0f}% 범위[{int(_valid.min())}~'
+                                  f'{int(_valid.max())}]중앙값{int(np.median(_valid))}mm')
+                    else:
+                        _dstat = '유효0% (depth 전체 0!)'
+                    self.get_logger().info(
+                        f"[DBG_COORD] 카메라pos=({cpos[0]:.0f},{cpos[1]:.0f},{cpos[2]:.0f})mm "
+                        f"중앙깊이={cd}mm 중앙base={bc_s} | depth {_dstat}")
 
                 # 메인 YOLO seg (있을 때만). plot() 는 class별 컬러 (red 포함)
                 # 칠해서 외곽선 색상 통일 안되므로 raw frame 사용. 우리는 자체
@@ -2239,6 +2895,7 @@ class WebcamSegNode(Node):
                 # 그 아래 노란 외곽선을 덮어 끊는 것 방지(외곽선이 항상 최상위).
                 self._pending_outlines = []
                 self._label_rects = []      # 라벨 충돌 회피용(frame 마다 리셋)
+                self._seg_seen = set()      # 이번 frame 에 그린 seg track (지속성용)
 
                 # YOLO26-obb: 회전 박스 (노란색 4 corner). corners + angle + size 보존.
                 obb_list = []  # [{'cx','cy','corners','angle_deg','pixel_w','pixel_h'}]
@@ -2341,6 +2998,13 @@ class WebcamSegNode(Node):
                     for gi, (x1, y1, x2, y2, phrase, score) in enumerate(gd_snap):
                         # 빨간 박스는 rect 계산 후 (mask_bbox 있으면 그것 사용)
                         cu, cv_y = (x1 + x2) // 2, (y1 + y2) // 2
+                        # 작업영역 게이트 — GD 검출 중심 base 좌표가 작업 범위 밖
+                        # (사람·모니터·배경)이거나 depth 불가면 핑크박스·라벨 전부 skip.
+                        _gdw = max(15, min((x2 - x1) // 2, (y2 - y1) // 2))
+                        _gb, _ = self.pixel_to_base_xyz(
+                            cu, cv_y, depth_arr, window=_gdw)
+                        if not self._in_work_zone(_gb):
+                            continue
                         font = cv2.FONT_HERSHEY_SIMPLEX
                         # 이 GD 박스 안을 YOLO seg 가 이미 검출했으면(seg_covers)
                         # GD 핑크박스+phrase 라벨을 숨김 — seg 가 정확한 클래스(can)로
@@ -2365,6 +3029,20 @@ class WebcamSegNode(Node):
                         _non_color = [w for w in phrase.split()
                                       if w.lower() not in _COLORS]
                         phrase_clean = _non_color[0] if _non_color else phrase
+                        # ── snack 오탐 억제 (GD-only) — 'snack' 인데 박스 영역이
+                        # 회색/저채도(로봇베이스·그림자 등)면 skip. 실측 snack sat≥49,
+                        # 회색물체 sat~26. seg 가 담당(seg_covers)하는 건 seg 필터가 처리.
+                        if (not seg_covers and 'snack' in phrase_clean.lower()):
+                            _sx1, _sy1 = max(0, x1), max(0, y1)
+                            _sx2 = min(frame.shape[1], x2)
+                            _sy2 = min(frame.shape[0], y2)
+                            if _sx2 - _sx1 >= 4 and _sy2 - _sy1 >= 4:
+                                _scrop = frame[_sy1:_sy2, _sx1:_sx2]
+                                _ssat = float(cv2.cvtColor(
+                                    _scrop, cv2.COLOR_BGR2HSV)[..., 1].mean())
+                                if _ssat < float(os.environ.get(
+                                        'WSN_SNACK_SAT', '42')):
+                                    continue
                         ocr_extra = gd_ocr_match.get(gi, '')
                         if ocr_extra:
                             name_label = f'{phrase_clean} {score:.2f} [{ocr_extra}]'
@@ -2801,6 +3479,9 @@ class WebcamSegNode(Node):
                 vH, vW = vis.shape[:2]
                 isnet_boxes = []     # SAM2 워커에 올릴 (key, x1,y1,x2,y2)
                 seg_centers = []     # YOLO seg 가 처리한 객체 중심 (GD-only 중복 방지)
+                # 1-9 선택용 인덱스 검출 리스트 (매 프레임 재수집; eye-in-hand 라
+                # base 좌표/cloud 는 현재 T_cam2base 로 매 프레임 새로 계산됨 — 캐싱 X)
+                self.detections = []
                 if res is not None and res.masks is not None:
                     try:
                         masks_data = res.masks.data.cpu().numpy()
@@ -2836,6 +3517,11 @@ class WebcamSegNode(Node):
                         dbg_items = []     # [OUTLINE_DEBUG] (bbox, refined_mask, cname)
                         for mi in range(masks_data.shape[0]):
                             if mi not in keep_mi:    # 중복 인스턴스 skip
+                                continue
+                            # 번호 대상 제한 — 과자(snack_bag)/캔(can)/바틀(bottle)만.
+                            # bread 등 그 외 클래스는 외곽선·번호·검출 전부 skip (사용자 요청).
+                            if self.yolo.names.get(int(cls_ids[mi]),
+                                                   '') not in ('bottle', 'can', 'snack_bag'):
                                 continue
                             m = (masks_data[mi] > 0.5).astype(np.uint8) * 255
                             if m.shape != (vH, vW):
@@ -2881,6 +3567,19 @@ class WebcamSegNode(Node):
                                 block=False,
                                 cname=self.yolo.names.get(
                                     int(cls_ids[mi]), str(cls_ids[mi])))
+                            # ── 작업영역 게이트 — base 좌표가 작업 범위 밖이면
+                            # (사람·모니터·로봇베이스 등 배경/먼 물체) 외곽선·라벨·dict
+                            # 전부 skip. 외곽선 그리기 전에 컷해서 노란선도 안 남게.
+                            _gate = self.mask_to_base_xyz(
+                                (refined > 0).astype(np.uint8), depth_arr)
+                            if _gate is None or not self._in_work_zone(_gate[2]):
+                                continue
+                            # ── snack 채도 필터 — snack_bag(2) 인데 회색/저채도면
+                            # (로봇베이스 등) 오검출 → skip (외곽선 전에 컷).
+                            if (int(cls_ids[mi]) == 2
+                                    and self._is_gray_nonsnack(
+                                        frame, (refined > 0).astype(np.uint8))):
+                                continue
                             # 외곽선 (tight) — 노랑
                             cnts, _ = cv2.findContours(
                                 refined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
@@ -2892,10 +3591,18 @@ class WebcamSegNode(Node):
                                 print(f'[DBG seg] {_cn} bbox={bbox} '
                                       f'used_sam={getattr(self,"_dbg_used_sam",None)} '
                                       f'ncnt={len(cnts)} areas={_ars}', flush=True)
-                            for c in cnts:
-                                if cv2.contourArea(c) < 50:
-                                    continue
-                                self._pending_outlines.append(c)  # 맨 끝에 그림
+                            _kept = [c for c in cnts if cv2.contourArea(c) >= 50]
+                            self._pending_outlines.extend(_kept)
+                            # 검출 지속성: 이 track 외곽선 캐시 — 붐비는 장면에서 한
+                            # 프레임 놓쳐도 ~0.6s 유지해 외곽선 깜빡임(검출됐다 안됐다)
+                            # 방지. (정적 객체 기준; track key 로 위치 매칭)
+                            _tkp = self._track_key(int(bbox[0]), int(bbox[1]),
+                                                   int(bbox[2]), int(bbox[3]))
+                            if not hasattr(self, '_outline_persist'):
+                                self._outline_persist = {}
+                            if _kept:
+                                self._outline_persist[_tkp] = (time.time(), _kept)
+                            self._seg_seen.add(_tkp)
                             dbg_items.append((bbox, refined.copy(), m.copy(),
                                               self.yolo.names.get(int(cls_ids[mi]),
                                                                   str(cls_ids[mi]))))
@@ -2906,6 +3613,21 @@ class WebcamSegNode(Node):
                                 continue
                             cu, cv_y, base_xyz = out
                             seg_centers.append((cu, cv_y))   # GD-only 중복 방지용
+                            # ── [DBG_COORD] 이 물체가 실제로 읽는 depth vs base z.
+                            # 캔이면 depth≈350mm(윗면)이어야 z≈+100. depth≈500(테이블)
+                            # 이면 z 음수 = 캔 뒤를 읽는 것(반사 구멍).
+                            if os.environ.get('DBG_COORD'):
+                                _mvals = depth_arr[mask01 > 0]
+                                _mvals = _mvals[_mvals > 0]
+                                if _mvals.size > 0:
+                                    _cn = self.yolo.names.get(int(cls_ids[mi]), '?')
+                                    self.get_logger().info(
+                                        f"[DBG_OBJ] {_cn} px=({int(cu)},{int(cv_y)}) "
+                                        f"depth[min{int(_mvals.min())} p25 "
+                                        f"{int(np.percentile(_mvals,25))} med"
+                                        f"{int(np.median(_mvals))} max{int(_mvals.max())}]mm "
+                                        f"→ base z={base_xyz[2]:.0f}mm "
+                                        f"(서있는캔이면 z>0 정상)")
                             # 클래스 시간투표 (track 별 최빈값) — can↔bottle 프레임간
                             # flip 깜빡임 완화. (일관 오분류는 재학습 필요)
                             _cid = int(cls_ids[mi])
@@ -2935,6 +3657,16 @@ class WebcamSegNode(Node):
                                                   float(base_xyz[1]),
                                                   float(base_xyz[2])],
                                 })
+                            # 1-9 선택용 검출 등록 (mask/center/cloud/bbox — GraspGen 입력)
+                            self.detections.append({
+                                'name': cname,
+                                'gg_label': gg_label,
+                                'center_base': np.asarray(base_xyz, dtype=float) / 1000.0,  # mm→m
+                                'center_px': (int(cu), int(cv_y)),
+                                'mask': mask01,
+                                'cloud_m': cloud,          # base frame (m), GraspGen 입력
+                                'bbox': tuple(int(v) for v in bbox),
+                            })
                             # rx/ry/rz 계산에 쓰인 픽셀을 초록 점으로 표시. 너무 많으면
                             # 객체·외곽선을 가림 → ~24개만 sparse 하게(작게) 표시.
                             if pix is not None and len(pix) > 0:
@@ -3176,13 +3908,140 @@ class WebcamSegNode(Node):
                     robot_status = 'connecting'
                 else:
                     cache = self._dsr_alive_cache
-                    if now - cache['last_t'] > cache['ttl']:
-                        cache['val'] = _is_dsr_alive(timeout=0.3)
-                        cache['last_t'] = now
+                    # 비차단: ros2 service list 가 ~0.4s 걸려 display 를 멈추므로
+                    # 백그라운드 스레드에서 체크(timeout 2s)하고 캐시만 갱신.
+                    # (0.3s 타임아웃은 service list(0.4s)보다 짧아 항상 OFFLINE 였음)
+                    if (now - cache['last_t'] > cache['ttl']
+                            and not cache.get('checking')):
+                        cache['checking'] = True
+
+                        def _dsr_chk(_c=cache):
+                            _v = _is_dsr_alive(timeout=2.0)
+                            _c['val'] = _v
+                            _c['last_t'] = time.time()
+                            _c['checking'] = False
+                        threading.Thread(target=_dsr_chk, daemon=True).start()
                     robot_status = 'OK' if cache['val'] else 'OFFLINE'
+                # 검출 지속성: 이번 frame 에 놓친 seg 객체도 최근(0.6s) 봤으면 외곽선
+                # 유지 → 깜빡임 제거.
+                if hasattr(self, '_outline_persist'):
+                    _np = time.time()
+                    for _tk, (_t, _cl) in list(self._outline_persist.items()):
+                        if _np - _t > 0.6:
+                            self._outline_persist.pop(_tk, None); continue
+                        if _tk not in self._seg_seen:
+                            self._pending_outlines.extend(_cl)
                 # 모아둔 외곽선을 맨 마지막에 그림 → 라벨 박스에 안 가리고 최상위.
                 for _oc in getattr(self, '_pending_outlines', []):
                     cv2.polylines(vis, [_oc], True, (0, 255, 255), 2)
+
+                # ── 검출 지속성(깜빡임 방지) + 위치기반 안정 lock ──
+                # 매 프레임 self.detections 를 통째로 새로 만들면 YOLO 가 한 프레임만
+                # 놓쳐도 번호가 사라짐(깜빡임) + 인덱스가 흔들려 lock 이 빗나감.
+                # → base XY 6cm 그리드를 트랙키로, 0.7s 동안 유지 + 키 순 안정정렬.
+                _now = time.time()
+                # 각 검출을 가장 가까운 기존 트랙(10cm 이내)에 매칭 → 그리드 경계
+                # 깜빡임 제거. 없으면 신규 트랙. (base XY 거리 기준)
+                for _d in self.detections:
+                    _cb = _d['center_base']
+                    # 매칭 임계 5cm: jitter(~2cm)보단 크고 물체간격(~10cm)보단 작게 →
+                    # 같은 물체는 추종, 다른 물체는 분리 (10cm면 인접 물체 합쳐짐).
+                    _best_tk = None; _best_d = 0.05
+                    for _tk2, _vv in self._det_track.items():
+                        _oc = _vv['det']['center_base']
+                        _dist = ((_cb[0]-_oc[0])**2 + (_cb[1]-_oc[1])**2) ** 0.5
+                        if _dist < _best_d:
+                            _best_d = _dist; _best_tk = _tk2
+                    if _best_tk is None:
+                        _best_tk = (round(float(_cb[0]), 3), round(float(_cb[1]), 3))
+                    # 고정 번호: 기존 트랙이면 그 번호 유지, 신규면 1-9 중 빈 번호.
+                    _ex = self._det_track.get(_best_tk)
+                    if _ex and _ex.get('num'):
+                        _num = _ex['num']
+                    else:
+                        _usednum = {v.get('num') for v in self._det_track.values()}
+                        _num = next((n for n in range(1, 10) if n not in _usednum), 0)
+                    _d['_tk'] = _best_tk
+                    _d['num'] = _num
+                    self._det_track[_best_tk] = {'det': _d, 't': _now, 'num': _num}
+                # 만료: 일반 2.5s. 단 잠긴 물체(locked_tk)는 만료 안 함(락 유지) —
+                # seg 가 한참 놓쳐도 LOCKED 표시·초록박스 안 사라지게.
+                for _k in [kk for kk, vv in self._det_track.items()
+                           if _now - vv['t'] > 8.0   # 8초 유지 (seg 간헐 검출 마스킹)
+                           and not (self.locked and kk == self.locked_tk)]:
+                    del self._det_track[_k]
+                _keys = sorted(self._det_track.keys())
+                self.detections = [self._det_track[k]['det'] for k in _keys]
+                # DBG: 검출 개수/이름/좌표 1초마다 — 장애물 후보 추적용
+                if os.environ.get('DBG_DET') and now - getattr(self, '_dbg_det_t', 0.0) > 1.0:
+                    self._dbg_det_t = now
+                    _info = [f"{d.get('name')}({d['center_base'][0]*1000:.0f},"
+                             f"{d['center_base'][1]*1000:.0f},"
+                             f"{d['center_base'][2]*1000:.0f})"
+                             for d in self.detections]
+                    _dobs = self._depth_obstacles()
+                    self.get_logger().info(
+                        f"[DBG_DET] tracks={len(self.detections)} {_info} "
+                        f"| depth_clusters={len(_dobs)} "
+                        f"{[[round(o['pos'][0]*1000),round(o['pos'][1]*1000)] for o in _dobs]}")
+                # 잠긴 물체를 인덱스가 아닌 트랙키(위치)로 추종 → 리스트가 재정렬돼도 유지
+                if self.locked and self.locked_tk is not None:
+                    if self.locked_tk in self._det_track:
+                        self.locked_idx = _keys.index(self.locked_tk)
+                        self.selected_idx = self.locked_idx
+                    elif self.detections:
+                        self.locked_idx = min(self.locked_idx or 0,
+                                              len(self.detections) - 1)
+                    else:
+                        self.locked_idx = None
+
+                # ── 고정 번호(num) 표시 + lock 하이라이트 (선택은 트랙키 기준) ──
+                for _d in self.detections:
+                    _x1, _y1, _x2, _y2 = _d['bbox']
+                    _is_sel = (self.locked and _d.get('_tk') == self.locked_tk)
+                    # 락 걸린 상태에서 타깃 외 검출 = 장애물(빨강 OBS). 미락이면 회색.
+                    if _is_sel:
+                        _col = (0, 255, 0); _lab = f"[{_d.get('num', '?')}]"
+                    elif self.locked:
+                        _col = (0, 0, 255)            # 빨강 = curobo 장애물
+                        _lab = f"[{_d.get('num', '?')}] OBS"
+                    else:
+                        _col = (200, 200, 200); _lab = f"[{_d.get('num', '?')}]"
+                    cv2.rectangle(vis, (_x1, _y1), (_x2, _y2), _col,
+                                  3 if _is_sel else 2)
+                    cv2.putText(vis, _lab, (_x1, _y1 - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, _col, 2)
+                # 락 중이면 장애물 상시 발행(~3Hz) — s/p 순간 외에도 curobo world 최신 유지
+                if self.locked and self._selected() is not None:
+                    if now - getattr(self, '_last_obs_pub', 0.0) > 0.33:
+                        self._publish_obstacles(self._selected(), log=False)
+                        self._last_obs_pub = now
+                # depth 장애물 시각화 — 분류기가 못 잡는 물체도 빨간 OBS 박스로(상시).
+                # ~0.3s 마다 계산·캐시, 매 프레임 캐시 박스만 그림(비용 절감).
+                if now - getattr(self, '_viz_obs_t', 0.0) > 0.3:
+                    self._viz_obs_t = now
+                    _ex = None
+                    if self.locked and self._selected() is not None:
+                        _c = self._selected().get('center_base')
+                        _ex = (float(_c[0]), float(_c[1])) if _c is not None else None
+                    self._viz_obs = self._depth_obstacles(exclude_xy=_ex)
+                for _ob in getattr(self, '_viz_obs', []):
+                    _pb = _ob.get('px_bbox')
+                    if _pb is None:
+                        continue
+                    cv2.rectangle(vis, (_pb[0], _pb[1]), (_pb[2], _pb[3]),
+                                  (0, 0, 255), 2)
+                    cv2.putText(vis, "OBS", (_pb[0], _pb[1] - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                if self.locked and self.locked_tk is not None:
+                    _lnum = self._det_track.get(self.locked_tk, {}).get('num', '?')
+                    cv2.putText(vis, f"LOCKED [{_lnum}] (r=unlock)",
+                                (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                if self.pending_grasp_pose is not None:
+                    _pb = self.pending_grasp_pose[0]
+                    cv2.putText(vis,
+                                f"GRASP PREVIEW ({_pb[0]*1000:.0f},{_pb[1]*1000:.0f},{_pb[2]*1000:.0f})mm  s=이동 p=12cm전진+집기 r=취소",
+                                (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
                 status = (f'FPS {fps_ema:5.1f}  det={n_det}  '
                           f'probes={len(self.probe_markers)}  '
                           f'ROBOT:{robot_status}')
@@ -3192,9 +4051,9 @@ class WebcamSegNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 200, 255) if armed else (0, 255, 0), 2)
                 cv2.putText(vis,
-                            '`+q+L=probe  `+w=PICK  `+s=PLACE  `+o=CONNECT  `+c=DISCONNECT  R=undo  c=clear  f=full  m=refine  ESC',
+                            'SPACE=E-STOP  h=HOME(scout)  1-9=lock  g=graspgen  s=move  p=전진+집기  r=cancel  q=quit',
                             (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                            (200, 200, 200), 1)
+                            (0, 0, 255), 1)
 
                 # 고정 1600x1200 으로 resize. 1280x720 입력 → 1.25배 upscale 이라
                 # INTER_LINEAR 로도 mosaic 없음 (FPS 우선).
@@ -3203,17 +4062,43 @@ class WebcamSegNode(Node):
                     interpolation=cv2.INTER_LINEAR)
                 cv2.imshow(self.win, vis_show)
                 k = cv2.waitKey(1) & 0xFF
-                if k == 27:
+                if k == 32:   # 🛑 스페이스바 = 비상정지 (창 포커스 시 백업; pynput 이 OS레벨 주)
+                    self._emergency_stop()
+                if k == 27 or (k == ord('q') and '`' not in self.keys_held):
                     break
+                # ── object_tracking 식 키: 1-9 lock / p pick / r cancel ──
+                if ord('1') <= k <= ord('9'):
+                    _wantnum = k - ord('0')   # '1'→1 ... '9'→9 (고정 번호)
+                    _match = next((d for d in self.detections
+                                   if d.get('num') == _wantnum), None)
+                    if _match is not None:
+                        self.locked = True
+                        self.locked_tk = _match.get('_tk')
+                        self.locked_idx = None
+                        self.get_logger().info(
+                            f"LOCKED [{_wantnum}] {_match['name']}")
+                if k == ord('h') and '`' not in self.keys_held:
+                    # 'h': 높은 scout 자세(카메라가 depth 범위 위)로 복귀
+                    self._go_home()
+                if k == ord('p') and '`' not in self.keys_held:
+                    # 'p': 파지점에서 축방향 전진 + 집기 + 15cm 수직 lift
+                    self.advance_and_grip()
+                if k == ord('r') and '`' not in self.keys_held:
+                    self.locked = False
+                    self.locked_idx = None
+                    self.locked_tk = None
+                    if self.clear_grasp_preview():
+                        self.get_logger().info('미리보기 취소됨')
+                    self.get_logger().info('UNLOCKED')
                 if k == ord('c') and '`' not in self.keys_held:
                     if self.probe_markers:
                         self.get_logger().info(
                             f'[clear] {len(self.probe_markers)}개 마커 삭제')
                     self.probe_markers.clear()
                 if k == ord('s') and '`' not in self.keys_held:
-                    fn = f'/tmp/webcam_seg_node_{int(time.time())}.png'
-                    cv2.imwrite(fn, vis)
-                    self.get_logger().info(f'screenshot: {fn}')
+                    # 's': GraspGen 파지점으로 이동만 (없으면 안내)
+                    if not self.move_to_grasp():
+                        self.get_logger().info("[s] 대기 파지 없음 — 'g' 먼저")
                 if k == ord('f') and '`' not in self.keys_held:
                     self._fullscreen = not self._fullscreen
                     cv2.setWindowProperty(
@@ -3237,22 +4122,8 @@ class WebcamSegNode(Node):
                         f'[m] mask_refine = {self._mask_refine} '
                         f'({"정밀" if self._mask_refine else "빠름"})')
                 if k == ord('g') and '`' not in self.keys_held:
-                    # 'g': 현재 프레임 물체별 base-frame PC 를 GraspGen 규격 .npz 로 저장
-                    # (키 'point_cloud', float32 (N,3), meter, base). 별도 모듈 사용.
-                    try:
-                        import graspgen_export as _gge
-                        buf = getattr(self, '_export_buf', [])
-                        ts = int(time.time())
-                        intr = (self.intr.fx, self.intr.fy,
-                                self.intr.ppx, self.intr.ppy)
-                        saved = _gge.export_detections(
-                            '/tmp/graspgen_pc', buf, ts=ts,
-                            intrinsics=intr, T_cam2base=self.T_cam2base)
-                        self.get_logger().info(
-                            f'[g] GraspGen export: {len(saved)}개 저장 '
-                            f'→ /tmp/graspgen_pc ({[os.path.basename(p) for p in saved]})')
-                    except Exception as e:
-                        self.get_logger().warn(f'[g] export 실패: {e}')
+                    # 'g': 선택 물체 GraspGen 추론 → RViz 미리보기 (로봇 안 움직임)
+                    self.send_graspgen()
         finally:
             try:
                 self.key_listener.stop()
