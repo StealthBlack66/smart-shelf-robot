@@ -29,6 +29,21 @@ onnxruntime==1.23.2   # rembg 백엔드
 # --- 보조 검출 (미학습 객체 open-vocab) — 번들됨 ---
 groundingdino-py==0.4.0   # models/groundingdino_swint_ogc.pth 번들(694MB), config 는 패키지 제공. GPU 필요
 
+# =====================================================================
+# === 모션 플래닝 / curobo (motion 노드 — curobo_planner_node.py) ===
+#   ※ 비전과 동일하게 시스템 python(/usr/bin/python3)에서 실행
+#   ⚠️ torch 는 curobo CUDA 빌드에 맞춰야 함 — 검증 환경: 2.12.0.dev+cu128
+#      (위 vision 의 torch>=2.1 과 호환. CUDA nightly 는 별도 --index-url 로 설치)
+warp-lang==1.0.2       # curobo 백엔드 (Warp 커널)
+yourdfpy==0.0.60       # curobo URDF 파싱
+trimesh==4.12.2        # curobo 메시 처리
+scipy==1.15.3          # 모션 좌표 변환 (scipy.spatial.transform Rotation)
+#
+# ※ pip 로 안 되는 의존 (별도 설치):
+#   - curobo           → github.com/NVlabs/curobo 소스에서  pip install -e .  (~/curobo)
+#   - dsr_msgs2 / dsr_gripper_tcp_interfaces → colcon 빌드(~/doosan_ws). 그리퍼 SetPosition/SafeGrasp
+# =====================================================================
+
 # === 선택 (기본 OFF, 필요 시만) ===
 # paddleocr                    # OCR (기본 OFF)
 # transformers, bitsandbytes   # Qwen2.5-VL (기본 OFF)

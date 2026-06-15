@@ -39,6 +39,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig
 from curobo.geom.types import WorldConfig, Cuboid
 from std_msgs.msg import String
 import json
+import yaml
 
 
 class CuroboPlanner(Node):
@@ -148,11 +149,17 @@ class CuroboPlanner(Node):
         self.act_safe_grasp = ActionClient(
             self, SafeGrasp, "/gripper_service/safe_grasp",
             callback_group=self.service_cb_group)
-        # 파지 파라미터(물성별 max_current 는 추후 클래스 연동; 기본값 tunable)
+        # 파지 파라미터(클래스 미지정/미정의 시 fallback 기본값)
         self.declare_parameter('grasp_target_position', 700)   # 0~700, 700=완전닫힘
         self.declare_parameter('grasp_max_current', 600)       # mA (bottle 수준 기본)
         self.declare_parameter('grasp_current_delta', 30)      # 파지검출 전류증분
         self.declare_parameter('grasp_open_position', 0)       # 열기 위치
+        # 물성별 파지 전류 — config/grasp_force_params.yaml 로드 (snack_bag/bottle/can)
+        self.grasp_force_params = self._load_grasp_force_params(config_dir)
+        # webcam_seg 가 보내는 파지 대상 클래스 (pick 직전 발행). gripper_grasp 에서 조회.
+        self.grasp_class = None
+        self.grasp_class_sub = self.create_subscription(
+            String, "/dsr01/curobo/grasp_class", self.grasp_class_cb, 10)
 
         self.get_logger().info("========================================")
         self.get_logger().info("cuRobo Planner Ready!")
@@ -642,11 +649,47 @@ class CuroboPlanner(Node):
             f"{'success' if res and res.success else 'fail/timeout'}")
         return bool(res and res.success)
 
+    def _load_grasp_force_params(self, config_dir):
+        """config/grasp_force_params.yaml 에서 물체별 파지힘(전류) 로드.
+        config_dir = .../config/curobo → 한 단계 위(.../config)에 yaml."""
+        path = os.path.join(os.path.dirname(config_dir), "grasp_force_params.yaml")
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+            gf = data.get('grasp_force', {})
+            self.get_logger().info(
+                f"물성별 파지힘 로드: {path} → {list(gf.keys())}")
+            return gf
+        except Exception as e:
+            self.get_logger().warn(
+                f"grasp_force_params.yaml 로드 실패({e}) → 고정 기본값 사용")
+            return {}
+
+    def grasp_class_cb(self, msg: String):
+        """webcam_seg 가 pick 직전 보낸 파지 대상 클래스(snack_bag/bottle/can/bread)."""
+        self.grasp_class = msg.data.strip() if msg.data else None
+        self.get_logger().info(f"[grasp_class] 파지 대상 클래스 = {self.grasp_class}")
+
     def gripper_grasp(self):
-        """파지 — 브리지 /gripper_service/safe_grasp 액션(전류기반, 물성별 max_current)."""
-        tp = int(self.get_parameter('grasp_target_position').value)
-        mc = int(self.get_parameter('grasp_max_current').value)
-        cd = int(self.get_parameter('grasp_current_delta').value)
+        """파지 — 브리지 /gripper_service/safe_grasp 액션(전류기반).
+        물체 클래스(self.grasp_class)별 전류를 grasp_force_params.yaml 에서 조회,
+        없으면 grasp_max_current 파라미터 기본값 사용."""
+        cls = getattr(self, 'grasp_class', None)
+        gf = self.grasp_force_params.get(cls) if cls else None
+        if gf:
+            tp = int(gf.get('goal_position', 700))
+            mc = int(gf.get('max_current', 600))
+            cd = int(gf.get('current_delta_threshold', 30))
+            self.get_logger().info(
+                f"물성별 파지: class={cls} → max_current={mc}mA delta={cd}")
+        else:
+            tp = int(self.get_parameter('grasp_target_position').value)
+            mc = int(self.get_parameter('grasp_max_current').value)
+            cd = int(self.get_parameter('grasp_current_delta').value)
+            if cls:
+                self.get_logger().warn(
+                    f"class '{cls}' grasp_force 정의 없음 → 기본 {mc}mA "
+                    f"(정의: {list(self.grasp_force_params.keys())})")
         if not self.act_safe_grasp.wait_for_server(timeout_sec=3.0):
             self.get_logger().error("safe_grasp action server not available"); return False
         goal = SafeGrasp.Goal()
