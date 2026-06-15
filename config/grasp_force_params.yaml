@@ -1,0 +1,19 @@
+# 물성별 파지힘 파라미터
+# 단위: N (뉴턴)
+# RH-P12-RN-A 최대 파지힘: 170N
+
+grasp_force:
+  snack_bag:
+    current_delta_threshold: 60.0
+    max_current: 160.0
+    goal_position: 700
+
+  bottle:
+    current_delta_threshold: 400.0
+    max_current: 500.0
+    goal_position: 700
+
+  can:
+    current_delta_threshold: 300.0
+    max_current: 400.0
+    goal_position: 700
