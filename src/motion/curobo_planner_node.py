@@ -54,9 +54,9 @@ class ArmControllerNode(Node):
     JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
     # Named joint targets (degrees)
-    HOME_JOINTS_DEG         = [409.280, 198.1, 359.840, 86.22, 103.79, 83.7]
+    HOME_JOINTS_DEG         = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
     SHELF_VIEW_JOINTS_DEG   = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
-    PRODUCT_VIEW_JOINTS_DEG = [-1.99, -4.79, 96.32, 5.09, 84.03, -2.56]
+    PRODUCT_VIEW_JOINTS_DEG = [0.0, -36.0, 56.0, 5.0, 110.0, 0.0]
 
     NAMED_TARGETS_DEG = {
         'home':         HOME_JOINTS_DEG,

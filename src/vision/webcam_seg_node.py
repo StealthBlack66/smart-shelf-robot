@@ -206,9 +206,7 @@ UI/마커/키조작은 webcam_seg.py 그대로:
   ros2 launch e0509_gripper_description webcam_seg.launch.py
 
 전제: 두산 본체 (dsr_bringup2) 는 별도 터미널에서 떠 있어야 함.
-  미감지 시 노드 시작할 때 _RealProject_0/00_두산로봇_리눅스_실물_연결.py 의
-  connect_doosan_linux() 를 자동 호출해 gnome-terminal 로 띄움.
-  수동 재연결: `+o` (connect), `+c` (disconnect).
+  두산 본체 (dsr_bringup2) 는 별도 터미널에서 수동으로 띄워야 함.
 
 
 
@@ -499,15 +497,10 @@ try:
 except Exception:
     _SETPOS_AVAIL = False
 try:
-    from dsr_msgs2.srv import MoveJoint  # 홈('h') 키 — 높은 scout 자세 복귀
+    from dsr_msgs2.srv import MoveJoint  # 'h' 키 — product_view 자세 복귀
     _MOVEJOINT_AVAIL = True
 except Exception:
     _MOVEJOINT_AVAIL = False
-try:
-    from dsr_msgs2.srv import MoveLine   # 홈 후 20cm 수직 상승 (depth 범위 위로)
-    _MOVELINE_AVAIL = True
-except Exception:
-    _MOVELINE_AVAIL = False
 
 # GraspGen ZMQ 클라이언트 (object_tracking 워크플로우 이식). ~/GraspGen path 추가.
 _GG_ROOT = os.path.expanduser("~/GraspGen")
@@ -523,7 +516,6 @@ except Exception as _gge:
 import pyrealsense2 as rs
 
 
-IS_DOOSAN_ROBOT_RECONNECTION = False
 
 # _RealProject_0 루트 (00_두산로봇_리눅스_실물_연결.py, doosan_config.py 위치)
 # scripts/ → e0509_gripper_description/ → src/ → doosan_ws/ → _RealProject_0/
@@ -566,19 +558,6 @@ HANGUL_TO_EN = {
 
 # --------- 두산 본체 (dsr_bringup2) 자동 연결 ---------
 
-def _is_dsr_alive(timeout=2.0):
-    """ros2 service list 로 /dsr01/motion/move_line 존재 여부 체크."""
-    try:
-        env = os.environ.copy()
-        # ROS bin / setup 보장
-        out = subprocess.run(
-            ['bash', '-ic',
-             'ros2 service list 2>/dev/null | grep -E "^/dsr01/motion/move_line$"'],
-            capture_output=True, text=True, timeout=timeout, env=env)
-        return bool(out.stdout.strip())
-    except Exception:
-        return False
-
 
 def _load_p00():
     """_RealProject_0/00_두산로봇_리눅스_실물_연결.py 동적 로드."""
@@ -597,130 +576,52 @@ def _load_p00():
         return None, f'load failed: {e}'
 
 
-def connect_doosan(logger=None, wait_sec=40):
-    """dsr_bringup2 안 떠 있으면 안전하게 새 gnome-terminal 에서 launch.
-
-    주의: 원본 00번의 connect_doosan_linux() 는 `pkill -9 -f ros2` 를 호출해서
-    현재 ros2 launch 로 떠있는 webcam_seg_node 자신까지 죽임. 그래서 여기서는
-    targeted pkill 만 (dsr / DRCF / rviz) 사용 + 00번 doosan_config 만 import.
-    """
-    if _is_dsr_alive():
-        if logger: logger.info('[connect] dsr_bringup2 이미 떠있음 — skip')
-        return True
-    if logger: logger.info('[connect] dsr_bringup2 안 떠있음 → safe launch')
-
-    # 1) targeted cleanup (자신은 안 죽임)
-    for pat in ('dsr_bringup', 'ros2 launch dsr', 'DRCF', 'rviz2'):
-        subprocess.run(['pkill', '-9', '-f', pat], capture_output=True)
-    time.sleep(2)
-
-    # 2) doosan_config 로드 (00번 파일과 같은 폴더, _PROJECT_ROOT)
-    if _PROJECT_ROOT not in sys.path:
-        sys.path.insert(0, _PROJECT_ROOT)
-    try:
-        import doosan_config as cfg
-    except Exception as e:
-        if logger: logger.error(f'[connect] doosan_config import 실패: {e}')
-        return False
-
-    # 3) ros2 launch 띄움 — 터미널 fallback chain
-    #    xfce4-terminal > x-terminal-emulator > nohup background (로그 파일)
-    ros_cmd = (
-        f'source /opt/ros/{cfg.ROS_DISTRO}/setup.bash && '
-        f'source {cfg.DOOSAN_WS}/install/setup.bash && '
-        f'ros2 launch {cfg.BRINGUP_PKG} {cfg.BRINGUP_LAUNCH} '
-        f'name:={cfg.NAMESPACE} model:={cfg.ROBOT_MODEL} mode:=real '
-        f'host:={cfg.ROBOT_IP} rt_host:={cfg.RT_HOST}'
-    )
-    if logger: logger.info(f'[connect] launch: {ros_cmd[:100]}...')
-
-    # gnome-terminal 은 snap 충돌 가능하니 마지막에 시도
-    log_file = '/tmp/dsr_bringup.log'
-    candidates = [
-        # (이름, 명령 템플릿) — {cmd} 는 실제 ros 명령
-        ('xfce4-terminal',
-         'xfce4-terminal --title=dsr_bringup2 -e "bash -c \\"{cmd}; exec bash\\""'),
-        ('x-terminal-emulator',
-         'x-terminal-emulator -e bash -c "{cmd}; exec bash"'),
-        ('nohup background',
-         f'nohup bash -c "{{cmd}}" > {log_file} 2>&1 &'),
-        ('gnome-terminal',
-         'gnome-terminal --title=dsr_bringup2 -- bash -c "{cmd}; exec bash"'),
-    ]
-    launched = False
-    for name, tmpl in candidates:
-        # nohup 은 무조건 사용 가능, 나머지는 which 체크
-        first_token = tmpl.split()[0]
-        if first_token != 'nohup':
-            if subprocess.run(['which', first_token],
-                              capture_output=True).returncode != 0:
-                continue
-        terminal_cmd = tmpl.format(cmd=ros_cmd)
-        try:
-            subprocess.Popen(terminal_cmd, shell=True)
-            if logger: logger.info(f'[connect] 사용: {name}')
-            if name == 'nohup background':
-                if logger: logger.info(f'[connect] 로그: {log_file}')
-            launched = True
-            break
-        except Exception as e:
-            if logger: logger.warn(f'[connect] {name} 실패: {e}')
-            continue
-    if not launched:
-        if logger: logger.error('[connect] 모든 터미널/백그라운드 실행 실패')
-        return False
-
-    # 4) 안정화 대기 (최대 wait_sec, 1초 간격 폴링)
-    for i in range(wait_sec):
-        time.sleep(1)
-        if _is_dsr_alive(timeout=1.0):
-            if logger: logger.info(f'[connect] dsr_bringup2 OK ({i+1}초)')
-            return True
-    if logger: logger.warn(f'[connect] {wait_sec}초 안에 못 띄움 — 수동 확인 필요')
-    return False
-
-
-def shutdown_doosan(logger=None):
-    """dsr_bringup2 + DRCF + rviz 만 종료 (자기 자신 안 죽임)."""
-    if logger: logger.info('[shutdown] dsr_bringup / DRCF / rviz 정리 (safe)')
-    for pat in ('dsr_bringup', 'ros2 launch dsr', 'DRCF', 'rviz2'):
-        subprocess.run(['pkill', '-9', '-f', pat], capture_output=True)
-    if logger: logger.info('[shutdown] 완료')
-
 
 class WebcamSegNode(Node):
     def __init__(self):
         super().__init__('webcam_seg_node')
+        self._declare_parameters()
 
-        # v13: 2026-05-29 fine-tuned pose_robust_seg (YOLO11s-seg, 50 epochs, heavy aug)
-        # 학습 데이터: 30 RealSense frames + GD+SAM2 auto-label. mAP50=0.99, mAP-Mask=0.92.
-        # classes: 0=bottle, 1=can, 2=snack_bag, 3=bread  (실측 m.names — 4-class)
-        self.declare_parameter('weights', _resolve(
-            'models/pose_robust_seg.pt', ''))
-        # 추가 모델들 (파일 있으면 자동 활성, 없으면 skip)
+        weights    = self.get_parameter('weights').value
+        calib_path = self.get_parameter('calibration_path').value
+        self.conf  = float(os.environ.get('WSN_CONF', self.get_parameter('conf').value))
+        self.iou   = float(self.get_parameter('iou').value)
+        self.imgsz = int(self.get_parameter('imgsz').value)
+        self.width  = int(self.get_parameter('width').value)
+        self.height = int(self.get_parameter('height').value)
+        self.approach_height = float(self.get_parameter('approach_height').value)
+        self.safe_z = float(self.get_parameter('safe_z').value)
+
+        if not os.path.exists(calib_path):
+            raise SystemExit(f'calibration 없음: {calib_path}')
+
+        self._load_vision_models(weights)
+        self._load_calibration(calib_path)
+        self._setup_realsense()
+        self._setup_ros_interfaces()
+        self._init_state()
+        self._setup_keyboard()
+        self._setup_window()
+
+
+    def _declare_parameters(self):
+        self.declare_parameter('weights', _resolve('models/pose_robust_seg.pt', ''))
         self.declare_parameter('weights_obb', _resolve('models/yolo26obb_can_pen.pt', ''))
-        # YOLOE 기본 비활성 (false positive 많음). 활성하려면 launch 시 weights_yoloe 지정.
         self.declare_parameter('weights_yoloe', '')
         self.declare_parameter('yoloe_prompts',
                                'green can,red can,coca cola,bottle,cup,pen,marker')
-        # GroundingDINO (background, 3초 주기) — 학습 안 한 물체도 자연어로 검출
         self.declare_parameter('gd_config',
                                os.path.expanduser('~/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'))
         self.declare_parameter('gd_weights',
                                os.path.expanduser('~/models/groundingdino_swint_ogc.pth'))
-        # caption 단순화 — 한 객체에 여러 phrase 매칭 방지 (snack/potato chip 중 하나만)
-        # cup 제외 (사용자 요청) — 4클래스 대상(can/bottle/snack)만 검출.
-        self.declare_parameter('gd_prompts',
-                               'can . bottle . snack bag')
+        self.declare_parameter('gd_prompts', 'can . bottle . snack bag')
         self.declare_parameter('gd_interval', 3.0)
         self.declare_parameter('gd_box_thr', 0.30)
         self.declare_parameter('gd_text_thr', 0.25)
-        # PaddleOCR (한국어+영어, background). 기본 OFF — Qwen2.5-VL 이 대체.
-        self.declare_parameter('ocr_lang', '')   # '' 면 비활성
+        self.declare_parameter('ocr_lang', '')
         self.declare_parameter('ocr_interval', 4.0)
         self.declare_parameter('ocr_min_score', 0.5)
-        # Qwen2.5-VL-3B — 4-bit 양자화 (NF4) 기본 활성. GD 와 공존 가능 (~2GB).
-        self.declare_parameter('qwen_enable', False)  # SAM 2 Large 위해 VRAM 양보
+        self.declare_parameter('qwen_enable', False)
         self.declare_parameter('qwen_4bit', True)
         self.declare_parameter('qwen_model', 'Qwen/Qwen2.5-VL-7B-Instruct')
         self.declare_parameter('qwen_interval', 6.0)
@@ -729,31 +630,16 @@ class WebcamSegNode(Node):
             '브랜드/제품명이 있으면 포함. 예: "초록색 칠성사이다 캔", "농심 포테토칲 봉지". '
             '한국어로만 답변하고 추가 설명은 하지마.')
         self.declare_parameter('calibration_path', _here('calibration_result.npz'))
-        # conf 0.40 + imgsz 960: 카메라를 depth dead-zone(>~0.5m) 위로 올려 운용하면
-        # 물체가 작아짐 → 작은 물체도 잡게 낮은 conf + 큰 입력. (camera 높이 운용 필수)
         self.declare_parameter('conf', 0.40)
         self.declare_parameter('iou', 0.5)
         self.declare_parameter('imgsz', 960)
-        self.declare_parameter('width', 1280)   # bottle mosaic 해결 위해 1280x720
+        self.declare_parameter('width', 1280)
         self.declare_parameter('height', 720)
-        self.declare_parameter('approach_height', 0.08)  # m
-        self.declare_parameter('safe_z', 0.15)           # m, target_pose Z 최소 보장
+        self.declare_parameter('approach_height', 0.08)
+        self.declare_parameter('safe_z', 0.15)
 
-        weights = self.get_parameter('weights').value
-        calib_path = self.get_parameter('calibration_path').value
-        self.conf = float(os.environ.get(
-            'WSN_CONF', self.get_parameter('conf').value))
-        self.iou = float(self.get_parameter('iou').value)
-        self.imgsz = int(self.get_parameter('imgsz').value)
-        self.width = int(self.get_parameter('width').value)
-        self.height = int(self.get_parameter('height').value)
-        self.approach_height = float(self.get_parameter('approach_height').value)
-        self.safe_z = float(self.get_parameter('safe_z').value)
-
-        if not os.path.exists(calib_path):
-            raise SystemExit(f'calibration 없음: {calib_path}')
-
-        # 메인 YOLO seg (비활성 가능)
+    def _load_vision_models(self, weights):
+        # YOLO seg
         self.yolo = None
         if weights and os.path.exists(weights):
             self.get_logger().info(f'YOLO seg 로드: {weights}')
@@ -762,7 +648,7 @@ class WebcamSegNode(Node):
         else:
             self.get_logger().info('YOLO seg 비활성 (weights 없음/미지정) — GD/obb 만 사용')
 
-        # YOLO26-obb (회전 박스, 옵션)
+        # YOLO obb
         self.yolo_obb = None
         obb_w = self.get_parameter('weights_obb').value
         if obb_w and os.path.exists(obb_w):
@@ -772,7 +658,7 @@ class WebcamSegNode(Node):
             except Exception as e:
                 self.get_logger().warn(f'YOLO obb 로드 실패: {e}')
 
-        # YOLOE (open-vocab, 옵션)
+        # YOLOE
         self.yoloe = None
         self.yoloe_prompts_str = ''
         yoloe_w = self.get_parameter('weights_yoloe').value
@@ -789,18 +675,18 @@ class WebcamSegNode(Node):
             except Exception as e:
                 self.get_logger().warn(f'YOLOE 로드 실패: {e}')
 
-        # GroundingDINO (open-vocab, background 주기)
+        # GroundingDINO
         self.gd_model = None
-        self.gd_prompts = self.get_parameter('gd_prompts').value
+        self.gd_prompts  = self.get_parameter('gd_prompts').value
         self.gd_interval = float(self.get_parameter('gd_interval').value)
-        self.gd_box_thr = float(self.get_parameter('gd_box_thr').value)
+        self.gd_box_thr  = float(self.get_parameter('gd_box_thr').value)
         self.gd_text_thr = float(self.get_parameter('gd_text_thr').value)
-        self.gd_results = []     # [(x1,y1,x2,y2, phrase, score)]  픽셀 좌표
-        self.gd_lock = threading.Lock()
-        self.gd_busy = False
-        self.gd_last_t = 0.0
+        self.gd_results  = []
+        self.gd_lock     = threading.Lock()
+        self.gd_busy     = False
+        self.gd_last_t   = 0.0
         gd_cfg = self.get_parameter('gd_config').value
-        gd_w = self.get_parameter('gd_weights').value
+        gd_w   = self.get_parameter('gd_weights').value
         if _GD_AVAIL and os.path.exists(gd_cfg) and os.path.exists(gd_w):
             try:
                 self.get_logger().info(f'GroundingDINO 로드: {gd_w}')
@@ -814,52 +700,47 @@ class WebcamSegNode(Node):
                 f'GroundingDINO 비활성 (avail={_GD_AVAIL}, cfg={os.path.exists(gd_cfg)}, '
                 f'weights={os.path.exists(gd_w)})')
 
-        # PaddleOCR (lang='' 면 skip — Qwen2.5-VL 이 대체)
-        self.ocr_model = None
+        # PaddleOCR
+        self.ocr_model    = None
         self.ocr_interval = float(self.get_parameter('ocr_interval').value)
         self.ocr_min_score = float(self.get_parameter('ocr_min_score').value)
-        self.ocr_results = []
-        self.ocr_lock = threading.Lock()
-        self.ocr_busy = False
-        self.ocr_last_t = 0.0
+        self.ocr_results  = []
+        self.ocr_lock     = threading.Lock()
+        self.ocr_busy     = False
+        self.ocr_last_t   = 0.0
         lang = self.get_parameter('ocr_lang').value
         if _OCR_AVAIL and lang:
             try:
                 self.get_logger().info(f'PaddleOCR 로드 중 (lang={lang})...')
                 self.ocr_model = PaddleOCR(
-                    use_angle_cls=True, lang=lang, use_gpu=True,
-                    show_log=False)
-                self.get_logger().info(f'PaddleOCR OK')
+                    use_angle_cls=True, lang=lang, use_gpu=True, show_log=False)
+                self.get_logger().info('PaddleOCR OK')
             except Exception as e:
                 self.get_logger().warn(f'PaddleOCR 로드 실패: {e}')
         else:
             self.get_logger().info('PaddleOCR 비활성 (Qwen2.5-VL 대체)')
 
-        # Qwen2.5-VL-3B (정밀 비전, background)
-        self.qwen_model = None
-        self.qwen_processor = None
-        self.qwen_interval = float(self.get_parameter('qwen_interval').value)
-        self.qwen_prompt = self.get_parameter('qwen_prompt').value
+        # Qwen2.5-VL — state
+        self.qwen_model       = None
+        self.qwen_processor   = None
+        self.qwen_interval    = float(self.get_parameter('qwen_interval').value)
+        self.qwen_prompt      = self.get_parameter('qwen_prompt').value
         self.qwen_result_text = ''
-        self.qwen_phrase_label = {}    # 'green can' -> '초록색 칠성사이다 캔' (cache)
-        self.qwen_lock = threading.Lock()
-        self.qwen_busy = False
-        # 매 frame 갱신되는 detection 정보 dict.
-        # key=phrase, value={phrase, score, center_pixel, center_world_mm,
-        #   angle_deg, corners_pixel, corners_world_mm, width_mm, height_mm}
-        self.last_detections = {}
-        # 회전 사각형 frame 간 smoothing cache: phrase_clean → 이전 corners/angle
+        self.qwen_phrase_label = {}
+        self.qwen_lock        = threading.Lock()
+        self.qwen_busy        = False
+        self.last_detections  = {}
         self.rect_smooth_cache = {}
+        self.qwen_last_t      = 0.0
 
-        # HQ-SAM 우선 (boundary 정확). vit_l > vit_b > vit_tiny 순 시도.
+        # HQ-SAM (vit_l > vit_b > vit_tiny 우선순위)
         self.hqsam_predictor = None
-        self.sam2_predictor = None
-        hq_candidates = [
-            ('vit_l', os.path.expanduser('~/models/sam_hq_vit_l.pth'), 'Large'),
-            ('vit_b', os.path.expanduser('~/models/sam_hq_vit_b.pth'), 'Base'),
+        self.sam2_predictor  = None
+        for arch, ckpt, label in [
+            ('vit_l',    os.path.expanduser('~/models/sam_hq_vit_l.pth'),    'Large'),
+            ('vit_b',    os.path.expanduser('~/models/sam_hq_vit_b.pth'),    'Base'),
             ('vit_tiny', os.path.expanduser('~/models/sam_hq_vit_tiny.pth'), 'Tiny'),
-        ]
-        for arch, ckpt, label in hq_candidates:
+        ]:
             if not (_HQSAM_AVAIL and os.path.exists(ckpt)):
                 continue
             try:
@@ -872,16 +753,13 @@ class WebcamSegNode(Node):
                 break
             except Exception as e:
                 self.get_logger().warn(f'HQ-SAM {label} 로드 실패: {e}')
-        # SAM 2 — 정밀 외곽선용. 단일 .py 실행만으로 '이전처럼' SAM2 켜지게
-        # 기본 활성(ENABLE_SAM2 기본 '1'). 끄려면 ENABLE_SAM2=0 으로 실행.
+
+        # SAM 2 (HQ-SAM 없을 때 fallback)
         if self.hqsam_predictor is None and os.environ.get('ENABLE_SAM2', '1') != '0':
-            sam2_large = os.path.expanduser('~/models/sam2_hiera_large.pt')
-            sam2_small = os.path.expanduser('~/models/sam2_hiera_small.pt')
-            sam2_tiny = os.path.expanduser('~/models/sam2_hiera_tiny.pt')
             for ckpt, cfg, label in [
-                (sam2_large, 'configs/sam2/sam2_hiera_l.yaml', 'Large'),
-                (sam2_small, 'configs/sam2/sam2_hiera_s.yaml', 'Small'),
-                (sam2_tiny, 'configs/sam2/sam2_hiera_t.yaml', 'Tiny'),
+                (os.path.expanduser('~/models/sam2_hiera_large.pt'), 'configs/sam2/sam2_hiera_l.yaml', 'Large'),
+                (os.path.expanduser('~/models/sam2_hiera_small.pt'), 'configs/sam2/sam2_hiera_s.yaml', 'Small'),
+                (os.path.expanduser('~/models/sam2_hiera_tiny.pt'),  'configs/sam2/sam2_hiera_t.yaml', 'Tiny'),
             ]:
                 if not (_SAM2_AVAIL and os.path.exists(ckpt)):
                     continue
@@ -894,27 +772,22 @@ class WebcamSegNode(Node):
                 except Exception as e:
                     self.get_logger().warn(f'SAM 2 {label} 로드 실패: {e}')
 
-        # rembg ISNet (DIS) — SAM2 보다 sharp boundary. CPU.
-        # BiRefNet 은 lite 도 CPU 에서 너무 느림 (main loop block) → ISNet 우선.
-        self.rembg_session = None
+        # rembg ISNet
+        self.rembg_session      = None
         self.rembg_session_name = None
         if _REMBG_AVAIL:
             try:
                 self.rembg_session = _rembg_new_session(
-                    'isnet-general-use',
-                    providers=['CPUExecutionProvider'])
+                    'isnet-general-use', providers=['CPUExecutionProvider'])
                 self.rembg_session_name = 'isnet-general-use'
-                self.get_logger().info(
-                    'rembg ISNet OK (CPU) — 외곽선 SAM2 보다 우선')
+                self.get_logger().info('rembg ISNet OK (CPU)')
             except Exception as e:
                 self.get_logger().warn(f'rembg ISNet 로드 실패: {e}')
-        # 정밀외곽 백그라운드 워커 (메인 루프 비블록 — 캐시만 공유).
-        # HQ-SAM(box-prompt, foundation) 우선 — 라벨/반사에 안 속고 sharp.
-        # 없으면 ISNet fallback. _sam_lock 으로 predictor 를 메인 스레드와 직렬화.
-        self._isnet_cache = {}
-        self._isnet_req = None
+
+        self._isnet_cache       = {}
+        self._isnet_req         = None
         self._isnet_worker_stop = False
-        self._sam_lock = threading.Lock()
+        self._sam_lock          = threading.Lock()
         if (self.hqsam_predictor is not None or self.sam2_predictor is not None
                 or self.rembg_session is not None):
             self._isnet_worker_thread = threading.Thread(
@@ -923,9 +796,10 @@ class WebcamSegNode(Node):
             _wname = ('HQ-SAM' if self.hqsam_predictor is not None
                       else 'SAM2' if self.sam2_predictor is not None else 'ISNet')
             self.get_logger().info(f'정밀외곽 워커 시작 ({_wname}, 백그라운드)')
-        self.qwen_last_t = 0.0
+
+        # Qwen2.5-VL — model load
         qwen_enable = bool(self.get_parameter('qwen_enable').value)
-        qwen_4bit = bool(self.get_parameter('qwen_4bit').value)
+        qwen_4bit   = bool(self.get_parameter('qwen_4bit').value)
         if not qwen_enable:
             self.get_logger().info('Qwen2.5-VL 비활성 (qwen_enable=False)')
         elif _QWEN_AVAIL:
@@ -947,106 +821,70 @@ class WebcamSegNode(Node):
                     self.qwen_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                         qm, torch_dtype=_torch.bfloat16, device_map='cuda')
                 self.qwen_processor = AutoProcessor.from_pretrained(qm)
-                self.get_logger().info(f'Qwen2.5-VL OK ({quant_label}) — interval={self.qwen_interval}s')
+                self.get_logger().info(
+                    f'Qwen2.5-VL OK ({quant_label}) — interval={self.qwen_interval}s')
             except Exception as e:
                 self.get_logger().warn(f'Qwen2.5-VL 로드 실패: {e}')
         else:
             self.get_logger().warn('Qwen2.5-VL 비활성 (transformers/Qwen 모듈 없음)')
 
+    def _load_calibration(self, calib_path):
         self.get_logger().info(f'캘리브 로드: {calib_path}')
         T = np.load(calib_path)['T_cam2base']
         self.T_cam2base = T
         self.get_logger().info(
             f'  translation (mm) = {np.round(T[:3, 3] * 1000, 1).tolist()}')
-
-        # ── Eye-in-hand 대응: 카메라가 그리퍼에 달려 움직이므로 고정 T_cam2base 는
-        # 캘리브 자세에서만 맞음. eih_fk_publisher 가 FK 로 발행하는 /eih/T_cam2base
-        # 를 구독해 실시간 갱신 (메시지 오면 고정값 대신 그걸 사용; 없으면 fallback).
         self._eih_active = False
         self.create_subscription(
             Float64MultiArray, '/eih/T_cam2base', self._eih_tcam_cb, 10)
         self.get_logger().info(
             '  /eih/T_cam2base 구독 — 로봇+eih_fk 떠있으면 실시간 변환(eye-in-hand) 사용')
 
+    def _setup_realsense(self):
         self.get_logger().info('RealSense 시작...')
         self.pipe = rs.pipeline()
         cfg = rs.config()
         cfg.enable_stream(rs.stream.color, self.width, self.height, rs.format.bgr8, 30)
         cfg.enable_stream(rs.stream.depth, self.width, self.height, rs.format.z16, 30)
         self.profile = self.pipe.start(cfg)
-        self.align = rs.align(rs.stream.color)
-        self.intr = self.profile.get_stream(rs.stream.color)\
-                                .as_video_stream_profile().get_intrinsics()
+        self.align   = rs.align(rs.stream.color)
+        self.intr    = (self.profile.get_stream(rs.stream.color)
+                                    .as_video_stream_profile().get_intrinsics())
         for _ in range(10):
             self.pipe.wait_for_frames()
         self.get_logger().info(f'  RealSense OK ({self.width}x{self.height})')
 
+    def _setup_ros_interfaces(self):
         cb_group = ReentrantCallbackGroup()
-        self.pub_pick = self.create_publisher(
-            PoseStamped, '/dsr01/curobo/pick_pose', 10)
-        self.pub_target = self.create_publisher(
-            PoseStamped, '/dsr01/curobo/target_pose', 10)
-        # 파지 대상 클래스 — curobo 가 물성별 전류(grasp_force_params.yaml) 적용용
-        self.pub_grasp_class = self.create_publisher(
-            String, '/dsr01/curobo/grasp_class', 10)
-        # 타깃 외 검출물체를 curobo 충돌맵에 장애물로 발행 (피해서 집기)
-        self.pub_obstacles = self.create_publisher(
-            String, '/dsr01/curobo/obstacles', 10)
-        # 그리퍼 열기(PLACE 릴리스) — 브리지 set_position(0). 파지(close)는 curobo 가 safe_grasp.
+        self.pub_pick        = self.create_publisher(PoseStamped, '/dsr01/curobo/pick_pose',   10)
+        self.pub_target      = self.create_publisher(PoseStamped, '/dsr01/curobo/target_pose', 10)
+        self.pub_grasp_class = self.create_publisher(String,      '/dsr01/curobo/grasp_class', 10)
+        self.pub_obstacles   = self.create_publisher(String,      '/dsr01/curobo/obstacles',   10)
         self.cli_open = (self.create_client(
             SetPosition, '/gripper_service/set_position',
             callback_group=cb_group) if _SETPOS_AVAIL else None)
-        # 🏠 홈('h') — 카메라가 depth dead-zone 위로 올라가는 높은 scout 자세 (deg).
-        # 사용자 지정 홈 (깨끗한 config, j4=5 → flip/하늘봄 없음). 아래보기.
-        self.cli_home = None
+        self.cli_product_view = None
         if _MOVEJOINT_AVAIL:
-            self.cli_home = self.create_client(
+            self.cli_product_view = self.create_client(
                 MoveJoint, '/dsr01/motion/move_joint', callback_group=cb_group)
-        self.cli_raise = None
-        if _MOVELINE_AVAIL:
-            self.cli_raise = self.create_client(
-                MoveLine, '/dsr01/motion/move_line', callback_group=cb_group)
-        # 검증된 단일 high 자세 (flip 없음 j4=5, 카메라 736mm 아래봄, 캔 z=+87 정상).
-        # move_line 상승은 손목 flip(카메라 위) 유발 → rise=0, 단일 move_joint 만.
-        _hp = os.environ.get('WSN_HOME', '0.0,-36.0,56.0,5.0,110.0,0.0')
-        self.home_pose = [float(v) for v in _hp.split(',')]
-        self.home_rise_mm = float(os.environ.get('WSN_HOME_RISE_MM', '0'))
-        self._home_last = 0.0
+        _hp = os.environ.get('WSN_PRODUCT_VIEW', '0.0,-36.0,56.0,5.0,110.0,0.0')
+        self.product_view_pose  = [float(v) for v in _hp.split(',')]
+        self._product_view_last = 0.0
 
-        # ── object_tracking 식 워크플로우 (1-9 lock + g/s/p) ──
-        self.grasp_pose_pub = self.create_publisher(
-            PoseStamped, '/dsr01/curobo/grasp_pose', 10)
-        self.marker_pub = self.create_publisher(
-            Marker, '/graspgen/preview_marker', 10)
-        self.detections = []          # 매 프레임 검출 [{name,center_base,mask,cloud_m,bbox}]
-        self.selected_idx = 0
-        self.locked = False
-        self.locked_idx = None
-        self._det_track = {}          # 트랙키(base XY grid) → {det, t} : 깜빡임 방지 지속성
-        self.locked_tk = None         # 잠긴 물체의 트랙키 (인덱스 대신 위치로 추종)
-        self.pending_grasp_pose = None  # (pos_m[3], quat_xyzw[4], approach[3]) or None
-        # p 전진거리(m): 카메라↔그리퍼끝 차이 보정 = 접근축 방향 12cm 전진.
-        # 실로봇에서 실제 차이에 맞게 조정 (부호 반대면 음수).
-        self.approach_advance = 0.12
-        # 그리퍼 밑동(curobo ee_link=gripper_rh_p12_rn_base) → 손가락 grasp center 거리.
-        # GraspGen 파지점은 손가락 사이(grasp center)이므로, 그리퍼 밑동 목표 =
-        # 파지점 − gripper_len×approach (뒤로 물려야 손가락이 파지점에 닿음).
-        # 그랩 기하 — pos(GraspGen 그리퍼원점, 물체 위쪽) 기준, approach 는 물체 쪽(아래).
-        #   s(프리그래스프) = pos - standoff*approach  (approach 반대=뒤/위로 물러남)
-        #   p(집기)        = pos + advance *approach  (approach 방향=물체로 전진/하강)
-        # 화살표 s→p 는 항상 +approach(물체 방향). advance 로 깊이 조절(12cm).
-        # 캔중심(C) 기준 모델 (노이즈 심한 GraspGen pos 대신 안정적 검출중심 사용):
-        #   p(집기,그리퍼밑동) = C - gripper_offset*approach  (손가락이 C 에 닿음)
-        #   s(프리그래스프)    = C - (gripper_offset+standoff)*approach
-        self.gripper_offset = 0.11     # 그리퍼 밑동→손가락 (13→11, p 2cm 더 전진)
-        self.pregrasp_standoff = 0.06  # 's' 추가 후퇴량
-        # 잡는 높이(base z, m) 고정 — 검출 z 가 노이즈로 흔들리는 대신 항상 같은 높이.
-        # 바닥(테이블)≈-30mm 기준. 기본 +50mm(바닥서 ~8cm). 'auto'면 검출 z 사용.
-        # 도달성: 너무 낮으면 수평 그랩 불가 → 60~120mm 권장.
+    def _init_state(self):
+        self.marker_pub     = self.create_publisher(Marker,      '/graspgen/preview_marker', 10)
+        self.detections        = []
+        self.selected_idx      = 0
+        self.locked            = False
+        self.locked_idx        = None
+        self._det_track        = {}
+        self.locked_tk         = None
+        self.pending_grasp_pose = None
+        self.approach_advance  = 0.12
+        self.gripper_offset    = 0.11
+        self.pregrasp_standoff = 0.06
         _gfz = os.environ.get('WSN_GRASP_FIXED_Z', '57.5')
-        self.grasp_fixed_z = (None if _gfz in ('auto', 'off', '')
-                              else float(_gfz) / 1000.0)
-        # GraspGen 클라이언트 (서버 :5556). 없으면 None 으로 두고 g 키에서 경고.
+        self.grasp_fixed_z = (None if _gfz in ('auto', 'off', '') else float(_gfz) / 1000.0)
         self.gg = None
         if _GRASPGEN_AVAIL:
             try:
@@ -1057,33 +895,12 @@ class WebcamSegNode(Node):
                 self.get_logger().warn(f'GraspGen 클라이언트 init 실패: {e}')
         else:
             self.get_logger().warn(f'GraspGen 모듈 없음: {_GRASPGEN_ERR}')
-
-        # 빨간 외곽선 = fine-tuned YOLO seg mask polygon (학습된 정확한 모양, ms 단위).
-        # 'm' 키 토글: True = ISNet+GrabCut 추가 정밀화 (느림). False = YOLO seg 만 (빠름).
-        # default False — 외곽선(노란선)은 Path B(YOLO mask + ISNet 워커 캐시, thresh 64)가
-        # 이미 tight 하게 담당. _mask_refine=True 는 추가로 Path A(GD bbox→SAM2+GrabCut rect,
-        # 매 프레임 _sam2_prepare)를 켜서 0.2 FPS 로 느려짐 → False 가 빠름+정확 둘 다.
-        self._mask_refine = False
-        self.pending_clicks = []        # [(u, v, kind)]
-        self.probe_markers = []         # [(u, v, base_xyz|None, err, kind)]
-        self.action_trigger = {'fire': None, 'last_t': 0.0}
-        self.keys_held = set()
-        self.motion_lock = threading.Lock()
-        self.robot_connect_thread = None
-        # robot status 캐시 (매 프레임 subprocess 호출 방지)
-        self._dsr_alive_cache = {'val': False, 'last_t': 0.0, 'ttl': 2.0}
-
-        self._setup_keyboard()
-        self._setup_window()
-
-        # 두산 자동 연결 (background — UI 안 멈춤)
-        if IS_DOOSAN_ROBOT_RECONNECTION:
-            self.get_logger().info('두산 본체 연결 시도 (background)...')
-            self.robot_connect_thread = threading.Thread(
-                target=connect_doosan, args=(self.get_logger(),), daemon=True)
-            self.robot_connect_thread.start()
-        else:
-            self.get_logger().info('두산 자동 연결 비활성 (IS_DOOSAN_ROBOT_RECONNECTION=False)')
+        self._mask_refine     = False
+        self.pending_clicks   = []
+        self.probe_markers    = []
+        self.action_trigger   = {'fire': None, 'last_t': 0.0}
+        self.keys_held        = set()
+        self.motion_lock      = threading.Lock()
 
     # ---------- 키/마우스 ----------
     def _normalize(self, key):
@@ -1096,73 +913,47 @@ class WebcamSegNode(Node):
         c = c.lower()
         return HANGUL_TO_EN.get(c, c)
 
-    def _go_home(self):
-        """🏠 'h' 키 — 높은 scout 자세(카메라가 depth 범위 위)로 복귀. 디바운스 1s."""
+    def _go_product_view(self):
+        """'h' 키 — product_view 자세로 이동. 디바운스 1s."""
         now_ = time.time()
-        if now_ - self._home_last < 1.0:
+        if now_ - self._product_view_last < 1.0:
             return
-        self._home_last = now_
-        if self.cli_home is None:
-            self.get_logger().error('🏠 홈 서비스 없음 (dsr_msgs2/MoveJoint)')
+        self._product_view_last = now_
+        if self.cli_product_view is None:
+            self.get_logger().error('product_view 서비스 없음 (dsr_msgs2/MoveJoint)')
             return
-        if not self.cli_home.service_is_ready():
-            if not self.cli_home.wait_for_service(timeout_sec=0.5):
-                self.get_logger().error('🏠 move_joint 서비스 미연결 — 브링업 확인')
+        if not self.cli_product_view.service_is_ready():
+            if not self.cli_product_view.wait_for_service(timeout_sec=0.5):
+                self.get_logger().error('move_joint 서비스 미연결 — 브링업 확인')
                 return
         try:
             req = MoveJoint.Request()
-            req.pos = [float(v) for v in self.home_pose]
+            req.pos = [float(v) for v in self.product_view_pose]
             req.vel = 30.0
             req.acc = 30.0
             req.time = 0.0
             req.radius = 0.0
             req.mode = 0       # ABSOLUTE
             req.blend_type = 0
-            req.sync_type = 0  # SYNC — 응답=모션 완료 → 그 다음 상승 체이닝
-            fut = self.cli_home.call_async(req)
-
-            def _then_rise(f):
-                # 홈 도달 후 수직 +상승 (depth 범위 위로). move_line REL base Z.
-                try:
-                    ok = getattr(f.result(), 'success', True)
-                except Exception as ex:
-                    self.get_logger().error(f"🏠 홈 응답 에러: {ex}"); ok = False
-                if not ok or self.cli_raise is None or self.home_rise_mm <= 0:
-                    self.get_logger().info(f"🏠 홈 도달 (단일 자세, 상승 없음)"); return
-                try:
-                    lr = MoveLine.Request()
-                    lr.pos = [0.0, 0.0, float(self.home_rise_mm), 0.0, 0.0, 0.0]
-                    lr.vel = [60.0, 30.0]; lr.acc = [120.0, 60.0]
-                    lr.time = 0.0; lr.radius = 0.0
-                    lr.ref = 0          # DR_BASE
-                    lr.mode = 1         # RELATIVE
-                    lr.blend_type = 0; lr.sync_type = 1
-                    self.cli_raise.call_async(lr)
-                    self.get_logger().info(
-                        f"🏠 홈 도달 → +{self.home_rise_mm:.0f}mm 수직 상승")
-                except Exception as ex:
-                    self.get_logger().error(f"🏠 상승 실패: {ex}")
-            fut.add_done_callback(_then_rise)
+            req.sync_type = 1
+            self.cli_product_view.call_async(req)
             self.get_logger().info(
-                f"🏠 [h] 홈 이동 → {[round(v,1) for v in self.home_pose]}° "
-                f"(도달 후 +{self.home_rise_mm:.0f}mm 상승)")
+                f"[h] product_view 이동 → {[round(v,1) for v in self.product_view_pose]}°")
         except Exception as e:
-            self.get_logger().error(f'🏠 홈 이동 실패: {e}')
+            self.get_logger().error(f'product_view 이동 실패: {e}')
 
     def _on_key_press(self, key):
         # (스페이스바 비상정지 제거됨 — 사용자 요청)
         c = self._normalize(key)
-        # ('h' 홈은 cv2.waitKey 핸들러에서만 처리 — 여기서 또 하면 move_joint 이중발사
+        # ('h' product_view는 cv2.waitKey 핸들러에서만 처리 — 여기서 또 하면 move_joint 이중발사
         #  → 충돌로 로봇이 엉뚱한 자세(하늘)로 감. OS레벨 중복 금지.)
         if not c:
             return
         self.keys_held.add(c)
-        if '`' in self.keys_held and c in ('w', 's', 'o', 'c'):
+        if '`' in self.keys_held and c == 'w':
             now_ = time.time()
             if now_ - self.action_trigger['last_t'] > ACTION_COOLDOWN_SEC:
-                mapping = {'w': 'pick', 's': 'place',
-                           'o': 'connect', 'c': 'disconnect'}
-                self.action_trigger['fire'] = mapping[c]
+                self.action_trigger['fire'] = 'pick'
                 self.action_trigger['last_t'] = now_
                 self.get_logger().info(
                     f'[key] `+{c} → {self.action_trigger["fire"]} armed')
@@ -2057,8 +1848,7 @@ class WebcamSegNode(Node):
         # 집기: 그리퍼밑동 = 캔중심 - 그리퍼길이*approach (손가락이 캔중심에 닿음).
         adv = np.asarray(C) - self.gripper_offset * np.asarray(approach)
         msg = self._pose_msg(adv, quat)
-        self.pub_pick.publish(msg)            # pick_pose_cb: open→descend→close→lift(15cm 수직)
-        self.grasp_pose_pub.publish(msg)
+        self.pub_pick.publish(msg)
         self.get_logger().info(
             f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach) → /dsr01/curobo/pick_pose "
             f"({adv[0]*1000:.0f},{adv[1]*1000:.0f},{adv[2]*1000:.0f})mm (이후 15cm 수직 lift)")
@@ -2735,7 +2525,7 @@ class WebcamSegNode(Node):
             return False
         req = SetPosition.Request()
         req.position = int(position)
-        req.timeout_sec = 3.0
+        req.timeout_sec = 0.5
         future = client.call_async(req)
         future.add_done_callback(
             lambda f: self.get_logger().info(
@@ -2768,27 +2558,6 @@ class WebcamSegNode(Node):
             self.pub_pick.publish(msg)
             # curobo_planner_node 가 approach → descend → close → lift 전체 처리
             time.sleep(0.5)  # publish 가 처리되는 동안 lock 유지
-        finally:
-            self.motion_lock.release()
-
-    def execute_place(self, base_xyz_mm):
-        if not self.motion_lock.acquire(blocking=False):
-            self.get_logger().warn('[place] 모션 진행중 — 무시')
-            return
-        try:
-            # safe_z 보장 (너무 낮으면 위로 올려 안전)
-            z_m = float(base_xyz_mm[2]) * 0.001
-            if z_m < self.safe_z:
-                base_xyz_mm = (base_xyz_mm[0], base_xyz_mm[1],
-                               self.safe_z * 1000.0)
-            msg = self._make_top_down_pose(base_xyz_mm)
-            self.get_logger().info(
-                f'[place] publish /target_pose '
-                f'pos=({msg.pose.position.x:.3f}, {msg.pose.position.y:.3f}, '
-                f'{msg.pose.position.z:.3f}) m → 도착 후 gripper open')
-            self.pub_target.publish(msg)
-            time.sleep(2.0)  # 이동 시간 대충 대기
-            self._gripper_open_call('place/open')
         finally:
             self.motion_lock.release()
 
@@ -3370,31 +3139,18 @@ class WebcamSegNode(Node):
                 if self.action_trigger['fire']:
                     action = self.action_trigger['fire']
                     self.action_trigger['fire'] = None
-                    if action == 'connect':
-                        self.get_logger().info('[connect] `+o → 두산 재연결 (background)')
-                        threading.Thread(
-                            target=connect_doosan, args=(self.get_logger(),),
-                            daemon=True).start()
-                    elif action == 'disconnect':
-                        self.get_logger().info('[disconnect] `+c → 두산 종료 (background)')
-                        threading.Thread(
-                            target=shutdown_doosan, args=(self.get_logger(),),
-                            daemon=True).start()
-                    elif action in ('pick', 'place'):
+                    if action == 'pick':
                         latest = None
                         for m in reversed(self.probe_markers):
                             if m[4] == 'probe' and m[2] is not None:
                                 latest = m
                                 break
                         if latest is None:
-                            self.get_logger().warn(
-                                f'[{action}] probe 없음 — `+q+좌클릭 먼저')
+                            self.get_logger().warn('[pick] probe 없음 — `+q+좌클릭 먼저')
                         else:
                             _, _, base_xyz, _, _ = latest
-                            fn = self.execute_pick if action == 'pick' \
-                                 else self.execute_place
                             threading.Thread(
-                                target=fn, args=(base_xyz,), daemon=True).start()
+                                target=self.execute_pick, args=(base_xyz,), daemon=True).start()
 
                 # 마커 그리기
                 for marker in self.probe_markers:
@@ -3846,25 +3602,6 @@ class WebcamSegNode(Node):
                            if fps_ema else inst_fps)
                 n_det = 0 if (res is None or res.boxes is None) else len(res.boxes)
                 armed = ('`' in self.keys_held) and ('q' in self.keys_held)
-                # 로봇 상태 (드라이버 서비스 존재 여부, 2초 캐시)
-                if self.robot_connect_thread and self.robot_connect_thread.is_alive():
-                    robot_status = 'connecting'
-                else:
-                    cache = self._dsr_alive_cache
-                    # 비차단: ros2 service list 가 ~0.4s 걸려 display 를 멈추므로
-                    # 백그라운드 스레드에서 체크(timeout 2s)하고 캐시만 갱신.
-                    # (0.3s 타임아웃은 service list(0.4s)보다 짧아 항상 OFFLINE 였음)
-                    if (now - cache['last_t'] > cache['ttl']
-                            and not cache.get('checking')):
-                        cache['checking'] = True
-
-                        def _dsr_chk(_c=cache):
-                            _v = _is_dsr_alive(timeout=2.0)
-                            _c['val'] = _v
-                            _c['last_t'] = time.time()
-                            _c['checking'] = False
-                        threading.Thread(target=_dsr_chk, daemon=True).start()
-                    robot_status = 'OK' if cache['val'] else 'OFFLINE'
                 # 검출 지속성: 이번 frame 에 놓친 seg 객체도 최근(0.6s) 봤으면 외곽선
                 # 유지 → 깜빡임 제거.
                 if hasattr(self, '_outline_persist'):
@@ -3996,8 +3733,7 @@ class WebcamSegNode(Node):
                     cv2.putText(vis, f"  approach: {_ot}",
                                 (10, 122), cv2.FONT_HERSHEY_SIMPLEX, 0.6, _oc, 2)
                 status = (f'FPS {fps_ema:5.1f}  det={n_det}  '
-                          f'probes={len(self.probe_markers)}  '
-                          f'ROBOT:{robot_status}')
+                          f'probes={len(self.probe_markers)}')
                 if armed:
                     status += '  [PROBE ARMED]'
                 cv2.putText(vis, status, (10, 28),
@@ -4030,7 +3766,7 @@ class WebcamSegNode(Node):
                             f"LOCKED [{_wantnum}] {_match['name']}")
                 if k == ord('h') and '`' not in self.keys_held:
                     # 'h': 높은 scout 자세(카메라가 depth 범위 위)로 복귀
-                    self._go_home()
+                    self._go_product_view()
                 if k == ord('p') and '`' not in self.keys_held:
                     # 'p': 파지점에서 축방향 전진 + 집기 + 15cm 수직 lift
                     self.advance_and_grip()
