@@ -34,7 +34,7 @@ if not torch.cuda.is_available():
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import PoseStamped, PoseArray
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
@@ -53,7 +53,46 @@ from dsr_gripper_tcp_interfaces.action import SafeGrasp
 class ArmControllerNode(Node):
     JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
-    # Named targets / place targets — config/place_targets.yaml 에서 로드 (_load_place_targets)
+    # Named joint targets (degrees)
+    HOME_JOINTS_DEG         = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
+    SHELF_VIEW_JOINTS_DEG   = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
+    PRODUCT_VIEW_JOINTS_DEG = [0.0, -36.0, 56.0, 5.0, 110.0, 0.0]
+
+    NAMED_TARGETS_DEG = {
+        'home':         HOME_JOINTS_DEG,
+        'shelf_view':   SHELF_VIEW_JOINTS_DEG,
+        'product_view': PRODUCT_VIEW_JOINTS_DEG,
+    }
+
+    # Place 시퀀스 좌표 (posx = [x,y,z mm, a,b,c ZYZ deg])
+    SLOT0_POINT_J_DEG  = [27.67, 5.82, 95.72, 90.93, 61.98, -10.64]
+    SLOT0_L_POSX       = [357.21, 511.97, 487.17, 89.98, 94.59, 90.0]
+    SLOT0_DOWN_L_POSX  = [357.230, 498.590, 468.640, 89.98, 94.59, 90.0]
+
+    SLOT1_POINT_J_DEG  = [21.17, 23.36, 72.79, 87.48, 68.49, -4.8]
+    SLOT1_L_POSX       = [483.77, 449.08, 493.21, 89.99, 94.59, 90.01]
+
+    SLOT2_POINT_J_DEG  = [22.17, 23.13, 103.31, 99.79, 69.5, -37.32]
+    SLOT2_L_POSX       = [413.61, 511.97, 310.56, 90.00, 90.58, 90.0]
+    SLOT2_DOWN_L_POSX  = [413.61, 511.97, 290.15, 103.00, 90.58, 90.0]
+
+    PLACE_TARGETS = {
+        'bottle': {
+            'point_j':         SLOT0_POINT_J_DEG,
+            'entry_posx':      SLOT0_L_POSX,
+            'grasp_down_posx': SLOT0_DOWN_L_POSX,
+        },
+        'snack_bag': {
+            'point_j':         SLOT1_POINT_J_DEG,
+            'entry_posx':      SLOT1_L_POSX,
+            'grasp_down_posx': None,
+        },
+        'can': {
+            'point_j':         SLOT2_POINT_J_DEG,
+            'entry_posx':      SLOT2_L_POSX,
+            'grasp_down_posx': SLOT2_DOWN_L_POSX,
+        },
+    }
 
     # 안전/속도 상수
     TCP_Z_MIN  = 0.02   # m, base 기준 TCP 최저 허용 Z (바닥 충돌 방지)
@@ -66,63 +105,28 @@ class ArmControllerNode(Node):
 
         self.declare_parameter('place_target', 'can')
         self.declare_parameter('grasp_target_position', 700)
-        self.declare_parameter('grasp_max_current',     400)
-        self.declare_parameter('grasp_current_delta',   300)
+        self.declare_parameter('grasp_max_current',     600)
+        self.declare_parameter('grasp_current_delta',   30)
         self.declare_parameter('grasp_open_position',   0)
 
         self.service_cb_group = rclpy.callback_groups.ReentrantCallbackGroup()
 
         # 상태
         self.current_joints = None
-
+        self.object_pose    = None
         self.grasp_class    = None
-        # [goalset 실험] webcam_seg가 보낸 GraspGen 후보 EE pose 묶음 + 수신시각
-        self.grasp_candidates = []   # [(pos[3], quat_xyzw[4]), ...]
-        self._cand_t = 0.0
-        # plan_grasp 최종진입 시 손가락 충돌 면제할 그리퍼 링크
-        # 파지 최종 진입 시 충돌면제할 그리퍼 링크 (핑거팁 r2/l2 포함 — 물체 접촉 허용)
-        self.gripper_coll_links = [
-            'gripper_rh_p12_rn_base', 'gripper_rh_p12_rn_r1', 'gripper_rh_p12_rn_l1',
-            'gripper_rh_p12_rn_r2', 'gripper_rh_p12_rn_l2', 'attached_object']
-        self.PREGRASP_STANDOFF = float(os.environ.get('CUROBO_PREGRASP_STANDOFF', '0.12'))
 
         # cuRobo 초기화 (GPU 1회만)
         self.get_logger().info("cuRobo 초기화 중...")
         config_dir = self._find_config_dir()
         self.tensor_args = TensorDeviceType(device=torch.device("cuda:0"))
 
-        # yml(from_dict) 로드 → 충돌구체(sim44, Isaac Sim 메시핏) + attached_object 적재.
-        # → plan_grasp(disable_collision_links) goalset 사용 가능 + 자기충돌·장애물 회피.
-        # ※ stage7 검증 설정 그대로: lock r1만, base_link(책상마운트) 충돌검사 제외.
-        #   base_link 안 빼면 정상자세에서도 base 구체가 팔과 헛충돌 → 모든 plan 실패(실증).
-        _cfg = yaml.safe_load(open(os.path.join(config_dir, "e0509_gripper.yml"), encoding='utf-8'))
-        _kin = _cfg["robot_cfg"]["kinematics"]
-        _kin["urdf_path"] = os.path.join(config_dir, _kin["urdf_path"])
-        _kin["asset_root_path"] = config_dir
-        _sph = yaml.safe_load(open(os.path.join(config_dir, _kin["collision_spheres"]), encoding='utf-8'))
-        _kin["collision_spheres"] = _sph["collision_spheres"]
-        _kin["lock_joints"] = {"gripper_rh_r1": 0.0}   # mimic(r2/l1/l2)는 따라옴
-        _kin["collision_link_names"] = [l for l in _kin["collision_link_names"] if l != "base_link"]
-        if isinstance(_kin.get("self_collision_ignore"), dict):
-            _kin["self_collision_ignore"].pop("base_link", None)
-            for _k in _kin["self_collision_ignore"]:
-                _kin["self_collision_ignore"][_k] = [x for x in _kin["self_collision_ignore"][_k] if x != "base_link"]
-        if isinstance(_kin.get("self_collision_buffer"), dict):
-            _kin["self_collision_buffer"].pop("base_link", None)
-        # 핑거팁(r2/l2 distal 핑거)도 충돌검사 포함 — sim44 에 구체 있음, mimic 이지만 FK OK.
-        #   안 넣으면 핑거 끝마디가 충돌검사 안 됨(접근 중 끝이 장애물에 닿아도 모름).
-        for _t in ('gripper_rh_p12_rn_r2', 'gripper_rh_p12_rn_l2'):
-            if _t not in _kin["collision_link_names"]:
-                _kin["collision_link_names"].append(_t)
-        # 그리퍼 클러스터(손목~핑거)는 서로 가까운 강체 → 상호 자기충돌 면제(헛충돌 방지)
-        _gcluster = ['link_5', 'link_6', 'gripper_rh_p12_rn_base',
-                     'gripper_rh_p12_rn_r1', 'gripper_rh_p12_rn_l1',
-                     'gripper_rh_p12_rn_r2', 'gripper_rh_p12_rn_l2', 'attached_object']
-        for _a in _gcluster:
-            _ign = set(_kin["self_collision_ignore"].get(_a, []))
-            _ign.update(x for x in _gcluster if x != _a)
-            _kin["self_collision_ignore"][_a] = list(_ign)
-        robot_cfg = RobotConfig.from_dict(_cfg["robot_cfg"], self.tensor_args)
+        robot_cfg = RobotConfig.from_basic(
+            urdf_path=os.path.join(config_dir, "e0509_gripper.urdf"),
+            base_link="base_link",
+            ee_link="gripper_rh_p12_rn_base",
+            tensor_args=self.tensor_args,
+        )
         world_cfg = WorldConfig(
             cuboid=[Cuboid(name="table", pose=[0.0, 0.0, -0.02, 1, 0, 0, 0],
                            dims=[1.2, 1.2, 0.04])]
@@ -131,41 +135,33 @@ class ArmControllerNode(Node):
             robot_cfg, world_cfg, self.tensor_args,
             num_trajopt_seeds=4, num_graph_seeds=4,
             collision_cache={"obb": 30, "mesh": 10},
-            use_cuda_graph=False,   # ★goalset(plan_grasp)↔single(plan) 혼용 시 'changing goal
-                                    #   type, cuda graph reset' 에러 회피 (가이드 4절 처방).
         )
         self.motion_gen = MotionGen(motion_gen_cfg)
         self.motion_gen.warmup(warmup_js_trajopt=False)
         self.get_logger().info("cuRobo 준비 완료!")
 
         self.grasp_force_params = self._load_grasp_force_params(config_dir)
-        self._load_place_targets(config_dir)
 
         # Subscribers
         self.create_subscription(JointState, '/dsr01/joint_states',
                                  self._joint_state_cb, 10)
+        self.create_subscription(PoseStamped, '/object_pose',
+                                 self._object_pose_cb, 10)
         # Pipeline B 토픽
-        # pick/target 콜백은 내부에서 서비스(spline/movel/posx)를 동기 대기하므로
-        # reentrant 그룹에 둬야 콜백 실행 중에도 서비스 응답 future 가 처리됨
-        # (기본 그룹이면 spline/posx future 가 30s/3s 타임아웃 → false 실패).
         self.create_subscription(PoseStamped, '/dsr01/curobo/target_pose',
-                                 self._target_pose_cb, 10,
-                                 callback_group=self.service_cb_group)
+                                 self._target_pose_cb, 10)
         self.create_subscription(PoseStamped, '/dsr01/curobo/pick_pose',
-                                 self._pick_pose_cb, 10,
-                                 callback_group=self.service_cb_group)
+                                 self._pick_pose_cb, 10)
         self.create_subscription(String, '/dsr01/curobo/obstacles',
                                  self._obstacles_cb, 10)
         self.create_subscription(String, '/dsr01/curobo/grasp_class',
                                  self._grasp_class_cb, 10)
-        # [goalset 실험] GraspGen 후보 묶음 구독
-        self.create_subscription(PoseArray, '/dsr01/curobo/grasp_candidates',
-                                 self._grasp_candidates_cb, 10)
 
         # Pipeline A 서비스 서버
         for name, cb in [
             ('/move_to_shelf_view',   self._srv_shelf_view),
             ('/move_to_product_view', self._srv_product_view),
+            ('/move_to_pick',         self._srv_pick),
             ('/move_to_place',        self._srv_place),
             ('/move_to_home',         self._srv_home),
         ]:
@@ -208,22 +204,10 @@ class ArmControllerNode(Node):
             get_package_share_directory("e0509_gripper_description"),
             "config", "curobo")
 
-    def _load_place_targets(self, config_dir):
-        path = os.path.join(os.path.dirname(config_dir), "place_targets.yaml")
-        with open(path) as f:
-            data = yaml.safe_load(f) or {}
-        self.NAMED_TARGETS_DEG = {k: list(v) for k, v in data.get('named_targets', {}).items()}
-        self.PLACE_TARGETS     = {k: {ik: (list(iv) if iv is not None else None)
-                                       for ik, iv in v.items()}
-                                   for k, v in data.get('place_targets', {}).items()}
-        self.get_logger().info(
-            f"place_targets 로드: named={list(self.NAMED_TARGETS_DEG)}, "
-            f"place={list(self.PLACE_TARGETS)}")
-
     def _load_grasp_force_params(self, config_dir):
         path = os.path.join(os.path.dirname(config_dir), "grasp_force_params.yaml")
         try:
-            with open(path, encoding='utf-8') as f:
+            with open(path) as f:
                 data = yaml.safe_load(f) or {}
             gf = data.get('grasp_force', {})
             self.get_logger().info(f"파지힘 로드: {list(gf.keys())}")
@@ -241,26 +225,12 @@ class ArmControllerNode(Node):
         if None not in joints:
             self.current_joints = joints
 
+    def _object_pose_cb(self, msg: PoseStamped):
+        self.object_pose = msg
+
     def _grasp_class_cb(self, msg: String):
         self.grasp_class = msg.data.strip() or None
-        if self.grasp_class and self.grasp_class in self.PLACE_TARGETS:
-            self.get_logger().info(
-                f"[grasp_class] {self.grasp_class} → place 준비됨")
-        else:
-            self.get_logger().warn(
-                f"[grasp_class] '{self.grasp_class}' — PLACE_TARGETS에 없음 "
-                f"(가능: {list(self.PLACE_TARGETS.keys())})")
-
-    def _grasp_candidates_cb(self, msg: PoseArray):
-        """[goalset 실험] webcam_seg가 보낸 GraspGen 후보 EE pose 묶음 저장."""
-        cands = []
-        for p in msg.poses:
-            cands.append((
-                [p.position.x, p.position.y, p.position.z],
-                [p.orientation.x, p.orientation.y, p.orientation.z, p.orientation.w]))
-        self.grasp_candidates = cands
-        self._cand_t = time.time()
-        self.get_logger().info(f"[grasp_candidates] 후보 {len(cands)}개 수신")
+        self.get_logger().info(f"[grasp_class] {self.grasp_class}")
 
     def _obstacles_cb(self, msg: String):
         try:
@@ -273,8 +243,8 @@ class ArmControllerNode(Node):
                     pose=[obj["pos"][0], obj["pos"][1], obj["pos"][2], 1, 0, 0, 0],
                     dims=obj.get("dims", [0.05, 0.05, 0.05])))
             self.motion_gen.update_world(WorldConfig(cuboid=cuboids))
-            #self.get_logger().info(
-                #f"장애물 업데이트: table + {len(data)}개")
+            self.get_logger().info(
+                f"장애물 업데이트: table + {len(data)}개")
         except Exception as e:
             self.get_logger().error(f"장애물 업데이트 실패: {e}")
 
@@ -300,14 +270,6 @@ class ArmControllerNode(Node):
         if self.current_joints is None:
             self.get_logger().warn("joint_states 미수신")
             return
-        # 기본: standoff-approach 단일경로 (파지점-STANDOFF 뒤 프리그래스프 → 축방향 직선 전진).
-        # goalset(plan_grasp) 실험경로는 CUROBO_USE_GOALSET=1 일 때만 (현재 44-구체 모델
-        # 링크명 불일치로 plan_grasp 예외 → 비활성. 고치면 재활성).
-        if (os.environ.get('CUROBO_USE_GOALSET', '0') != '0'
-                and self.grasp_candidates and (time.time() - self._cand_t) < 60.0):
-            if self._do_pick_goalset():
-                return
-            self.get_logger().warn("plan_grasp 실패 → standoff 단일경로 fallback")
         self._do_pick_sequence(msg)
 
     # ── Pipeline A 서비스 핸들러 ──────────────────────────────
@@ -324,13 +286,25 @@ class ArmControllerNode(Node):
         response.message = "완료" if ok else "실패"
         return response
 
+    def _srv_pick(self, request, response):
+        if self.object_pose is None:
+            response.success = False
+            response.message = "/object_pose 미수신"
+            return response
+        if self.current_joints is None:
+            response.success = False
+            response.message = "joint_states 미수신"
+            return response
+        self._do_pick_sequence(self.object_pose)
+        response.success = True
+        response.message = "Pick 완료"
+        return response
+
     def _srv_place(self, request, response):
-        used_target = (self.grasp_class
-                       if self.grasp_class and self.grasp_class in self.PLACE_TARGETS
-                       else self.get_parameter('place_target').get_parameter_value().string_value)
         ok = self._move_to_place()
+        place_target = self.get_parameter('place_target').get_parameter_value().string_value
         response.success = ok
-        response.message = f"Place {'완료' if ok else '실패'} ({used_target})"
+        response.message = f"Place {'완료' if ok else '실패'} ({place_target})"
         return response
 
     def _srv_home(self, request, response):
@@ -342,61 +316,30 @@ class ArmControllerNode(Node):
     # ── Pick 시퀀스 ──────────────────────────────────────────
 
     def _do_pick_sequence(self, pose: PoseStamped):
-        """open → (cuRobo) 접근축 STANDOFF 뒤 프리그래스프 → (MoveLine 직선) 축방향 전진
-        → move_stop → safe_grasp → lift. 캔에 비스듬히 내려박지 않고 파지축으로 곧게 진입."""
+        """open → cuRobo 하강 → move_stop → safe_grasp → lift"""
         pos, ori = pose.pose.position, pose.pose.orientation
-        quat_wxyz = [ori.w, ori.x, ori.y, ori.z]
         LIFT_HEIGHT = 0.15  # m
-        STANDOFF = float(os.environ.get('CUROBO_PICK_STANDOFF', '0.12'))  # m, 축방향 후퇴거리
-
-        grasp = np.array([pos.x, pos.y, pos.z], dtype=float)
-        if grasp[2] < self.TCP_Z_MIN:
+        grasp_z = pos.z
+        if pos.z < self.TCP_Z_MIN:
             self.get_logger().warn(
-                f"[FLOOR GUARD] pick z={grasp[2]*1000:.1f}mm → {self.TCP_Z_MIN*1000:.0f}mm 클램프")
-            grasp[2] = self.TCP_Z_MIN
-        # 접근축 = 그리퍼 Z (orientation 3번째 열). 프리그래스프 = 파지점 - STANDOFF·approach.
-        approach = self._quat_to_rotm(quat_wxyz)[:, 2]
-        approach = approach / (np.linalg.norm(approach) + 1e-9)
-        pre = grasp - STANDOFF * approach
+                f"[FLOOR GUARD] pick z={pos.z*1000:.1f}mm → {self.TCP_Z_MIN*1000:.0f}mm 클램프")
+            grasp_z = self.TCP_Z_MIN
 
-        self.get_logger().info("=== PICK Step 1/5: 그리퍼 열기 ===")
+        self.get_logger().info("=== PICK Step 1/4: 그리퍼 열기 ===")
         self.gripper_open()
         time.sleep(1.5)
 
-        self.get_logger().info(
-            f"=== PICK Step 2/5: 프리그래스프 이동 (파지점-{STANDOFF*100:.0f}cm·approach, cuRobo) "
-            f"→ ({pre[0]*1000:.0f},{pre[1]*1000:.0f},{pre[2]*1000:.0f})mm ===")
-        traj = self.plan(self.current_joints, pre.tolist(), quat_wxyz)
+        self.get_logger().info(f"=== PICK Step 2/4: 하강 Z={grasp_z*1000:.1f}mm (cuRobo) ===")
+        traj = self.plan(self.current_joints, [pos.x, pos.y, grasp_z],
+                         [ori.w, ori.x, ori.y, ori.z])
         if traj is None:
-            self.get_logger().error("Pick 실패: 프리그래스프 경로계획 불가")
+            self.get_logger().error("Pick 실패: 경로계획 불가")
             return
-        if not self.execute_spline(traj):
-            self.get_logger().error("Pick 실패: 프리그래스프 실행 실패")
-            return
-        spline_vel_scale = 1.5 if self.grasp_class == 'snack_bag' else 1.0
-        self.execute_spline(traj, vel_scale=spline_vel_scale)
+        self.execute_spline(traj)
         time.sleep(2.0)
-        # 프리그래스프에서 실제 풀린 자세(원본/180°플립) — 전진도 같은 자세로 (손목 연속)
-        q = getattr(self, '_last_plan_quat_wxyz', quat_wxyz)  # [w,x,y,z]
-
-        # Step 3: 같은 자세로 grasp 지점까지 cuRobo joint 경로 전진.
-        #   MoveLine(오일러 ZYZ b=90° 짐벌락 → 직진중 손목 90° 튐) 회피.
-        #   현재(프리그래스프) joint 에서 seed → 손목 연속, allow_yaw_retry=False(재플립 금지).
-        self.get_logger().info(
-            f"=== PICK Step 3/5: 축방향 전진 {STANDOFF*100:.0f}cm (cuRobo joint, 손목연속) "
-            f"→ ({grasp[0]*1000:.0f},{grasp[1]*1000:.0f},{grasp[2]*1000:.0f})mm ===")
-        traj2 = self.plan(self.current_joints, grasp.tolist(), q,
-                          allow_yaw_retry=False)
-        if traj2 is None:
-            self.get_logger().error("Pick 실패: 전진 경로계획 불가")
-            return
-        if not self.execute_spline(traj2):
-            self.get_logger().error("Pick 실패: 전진 실행 실패")
-            return
-        time.sleep(1.5)
 
         # 이동 직후 컨트롤러 motion 상태 클리어 → 그래야 flange serial 그리퍼가 닿음
-        self.get_logger().info("=== PICK Step 4/5: move_stop → 그리퍼 닫기 ===")
+        self.get_logger().info("=== PICK Step 3/4: move_stop → 그리퍼 닫기 ===")
         try:
             if self.cli_stop.wait_for_service(timeout_sec=2.0):
                 sr = MoveStop.Request()
@@ -411,83 +354,10 @@ class ArmControllerNode(Node):
         self.gripper_grasp()
         time.sleep(1.5)
 
-        self.get_logger().info("=== PICK Step 5/5: 수직 상승 (자세 유지) ===")
+        self.get_logger().info("=== PICK Step 4/4: 수직 상승 (자세 유지) ===")
         self.lift_straight_up(LIFT_HEIGHT, vel=50.0)
         time.sleep(1.5)
         self.get_logger().info("=== PICK 완료 ===")
-
-    def _do_pick_goalset(self):
-        """[goalset 실험] open → plan_grasp(후보 묶음, 무충돌·도달 best 선택) →
-        2단계 진입(approach→grasp) → move_stop → safe_grasp → lift."""
-        cands = self.grasp_candidates
-        N = len(cands)
-        if N == 0:
-            return False
-        _pl = np.zeros((1, N, 3), dtype=np.float32)
-        _ql = np.zeros((1, N, 4), dtype=np.float32)
-        for i, (p, q) in enumerate(cands):
-            _pl[0, i] = p
-            _ql[0, i] = [q[3], q[0], q[1], q[2]]   # xyzw → wxyz
-        gposes = Pose(position=self.tensor_args.to_device(_pl),
-                      quaternion=self.tensor_args.to_device(_ql))
-        start_state = CuroboJointState.from_position(
-            position=torch.tensor([self.current_joints], device="cuda:0", dtype=torch.float32),
-            joint_names=self.JOINT_NAMES)
-
-        self.get_logger().info(f"=== PICK(goalset) 1/4: 그리퍼 열기 (후보 {N}개) ===")
-        self.gripper_open()
-        time.sleep(1.5)
-
-        self.get_logger().info(f"=== PICK(goalset) 2/4: plan_grasp({N}후보, 2단계 진입) ===")
-        try:
-            gres = self.motion_gen.plan_grasp(
-                start_state, gposes, MotionGenPlanConfig(max_attempts=4),
-                grasp_approach_offset=Pose.from_list(
-                    [0, 0, -self.PREGRASP_STANDOFF, 1, 0, 0, 0]),
-                disable_collision_links=list(self.gripper_coll_links),
-                plan_grasp_to_retract=False)
-        except Exception as e:
-            self.get_logger().error(f"plan_grasp 예외: {e}")
-            return False
-        if not bool(gres.success.item()):
-            self.get_logger().warn("plan_grasp: 도달가능·무충돌 후보 없음")
-            return False
-        gi = int(gres.goalset_index.item())
-        self.get_logger().info(f"[goalset] 선택 후보 #{gi+1}/{N}")
-        try:
-            self.get_logger().info(
-                f"  → 2a) 프리그래스프 접근 (파지점 {self.PREGRASP_STANDOFF*100:.0f}cm 뒤로)")
-            cmd_a = gres.approach_result.get_interpolated_plan().position.cpu().numpy()
-            self.execute_spline(cmd_a)
-            time.sleep(2.0)
-            self.get_logger().info(
-                f"  → 2b) 축방향 {self.PREGRASP_STANDOFF*100:.0f}cm 쭉 전진해서 파지점 도달")
-            cmd_g = gres.grasp_result.get_interpolated_plan().position.cpu().numpy()
-            self.execute_spline(cmd_g)
-            time.sleep(1.5)
-        except Exception as e:
-            self.get_logger().error(f"goalset 궤적 실행 실패: {e}")
-            return False
-
-        self.get_logger().info("=== PICK(goalset) 3/4: move_stop → safe_grasp ===")
-        try:
-            if self.cli_stop.wait_for_service(timeout_sec=2.0):
-                sr = MoveStop.Request(); sr.stop_mode = 1
-                f = self.cli_stop.call_async(sr)
-                t0 = time.time()
-                while not f.done() and time.time() - t0 < 3.0:
-                    time.sleep(0.05)
-        except Exception as e:
-            self.get_logger().warn(f"move_stop 실패(무시): {e}")
-        time.sleep(1.0)
-        self.gripper_grasp()
-        time.sleep(1.5)
-
-        self.get_logger().info("=== PICK(goalset) 4/4: 수직 상승 ===")
-        self.lift_straight_up(0.15, vel=50.0)
-        time.sleep(1.5)
-        self.get_logger().info("=== PICK(goalset) 완료 ===")
-        return True
 
     # ── 고수준 모션 ──────────────────────────────────────────
 
@@ -508,12 +378,7 @@ class ArmControllerNode(Node):
     def _move_to_place(self) -> bool:
         """접근 joint → 진입 pose → 수직 하강(선택) → 그리퍼 열기 → 복귀
         cuRobo 검증 없이 직접 실행 (place 좌표는 사전 검증된 하드코딩값)."""
-        # self.grasp_class 우선 사용 (grasp_class 토픽에서 직접 갱신됨)
-        # 없으면 파라미터 fallback
-        param_target = self.get_parameter('place_target').get_parameter_value().string_value
-        place_target = (self.grasp_class
-                        if self.grasp_class and self.grasp_class in self.PLACE_TARGETS
-                        else param_target)
+        place_target = self.get_parameter('place_target').get_parameter_value().string_value
         if place_target not in self.PLACE_TARGETS:
             self.get_logger().error(
                 f"알 수 없는 place_target: '{place_target}' "
@@ -521,7 +386,7 @@ class ArmControllerNode(Node):
             return False
         target = self.PLACE_TARGETS[place_target]
         self.get_logger().info(f"_move_to_place: '{place_target}'")
-        # time.sleep(10.0)
+        time.sleep(10.0)
 
         if not self._execute_movej(target['point_j']):
             return False
@@ -566,26 +431,13 @@ class ArmControllerNode(Node):
             joint_names=self.JOINT_NAMES,
         )
 
-        # 1차: 원본 + 180°플립(평행조 그리퍼는 같은 파지) 둘 다 풀어서
-        #      손목(J6)이 적게 도는 쪽 선택 → 불필요한 한바퀴 회전 방지.
-        sj6 = float(start_joints[5])
-        flip_quat = self._quat_yaw(target_quat_wxyz, np.pi)
+        # 1차: 원본 target
         base = self._plan_once(start_state, target_pos, target_quat_wxyz)
-        flip = self._plan_once(start_state, target_pos, flip_quat)
-        # 선택한 해의 orientation 저장 (전진 단계가 그 자세 그대로 명령 — 손목 안 돌게)
-        self._last_plan_quat_wxyz = list(target_quat_wxyz)
-        cands = []
-        for nm, tr, q in (('원본', base, target_quat_wxyz), ('180°flip', flip, flip_quat)):
-            if tr is not None and (not prefer_positive_j4 or self._traj_j4_ok(tr)):
-                cands.append((nm, tr, q))
-        if cands:
-            nm, best, q = min(cands, key=lambda c: self._wrist_travel(c[1], sj6))
-            self._last_plan_quat_wxyz = list(q)
+        if base is not None and (not prefer_positive_j4 or self._traj_j4_ok(base)):
             self.get_logger().info(
-                f"계획 OK [{nm}]: {(time.time()-t0)*1000:.1f}ms, {best.shape[0]}pts "
-                f"(손목 J6 {np.degrees(self._wrist_travel(best, sj6)):.0f}° 회전, "
-                f"j4_min={np.degrees(best[:,3].min()):.1f}°)")
-            return best
+                f"계획 OK: {(time.time()-t0)*1000:.1f}ms, {base.shape[0]}pts "
+                f"(j4_min={np.degrees(base[:,3].min()):.1f}°)")
+            return base
 
         # yaw 등가 재시도 (j4 양수 해 탐색)
         if allow_yaw_retry and prefer_positive_j4:
@@ -662,39 +514,6 @@ class ArmControllerNode(Node):
     def _traj_j4_ok(self, positions):
         return float(np.min(positions[:, 3])) >= self.J4_MIN_RAD
 
-    def _wrist_travel(self, positions, start_j6):
-        """trajectory 가 J6(손목)를 start 에서 얼마나 멀리 도는지(rad). 작을수록 좋음.
-        한바퀴(>180°) 도는 해 vs 등가 해 비교용."""
-        j6 = positions[:, 5]
-        return float(max(abs(float(j6.max()) - start_j6),
-                         abs(float(j6.min()) - start_j6)))
-
-    def _advance_along(self, approach, dist_m, vel=60.0):
-        """현재 TCP 자세(rx/ry/rz) 그대로 유지하며 approach 방향으로 dist_m 직선 전진.
-        orientation 을 다시 명령하지 않으므로 손목이 돌지 않음 (플립 해도 그대로 진입)."""
-        if not self.cli_posx.wait_for_service(timeout_sec=3.0):
-            self.get_logger().error("GetCurrentPosx 없음 — 전진 취소"); return False
-        fut = self.cli_posx.call_async(GetCurrentPosx.Request())
-        t0 = time.time()
-        while not fut.done() and (time.time() - t0) < 3.0:
-            time.sleep(0.05)
-        if not (fut.done() and fut.result()):
-            self.get_logger().error("GetCurrentPosx 실패 — 전진 취소"); return False
-        cur = list(fut.result().task_pos_info[0].data)  # [x,y,z,rx,ry,rz] mm/deg
-        a = np.asarray(approach, dtype=float)
-        a = a / (np.linalg.norm(a) + 1e-9) * dist_m * 1000.0  # mm
-        req = MoveLine.Request()
-        req.pos = [cur[0]+a[0], cur[1]+a[1], cur[2]+a[2], cur[3], cur[4], cur[5]]
-        _v = vel * self.VEL_SCALE
-        req.vel = [_v, 30.0 * self.VEL_SCALE]; req.acc = [_v, 30.0 * self.VEL_SCALE]
-        req.time = 0.0; req.ref = 0; req.mode = 0
-        req.blend_type = 0; req.sync_type = 1
-        self.get_logger().info(
-            f"전진(자세유지): ({cur[0]:.0f},{cur[1]:.0f},{cur[2]:.0f}) → "
-            f"({cur[0]+a[0]:.0f},{cur[1]+a[1]:.0f},{cur[2]+a[2]:.0f})mm "
-            f"rz={cur[5]:.0f}° 유지")
-        return self._wait_for_motion(self.cli_movel.call_async(req), "MoveLine전진")
-
     def _quat_yaw(self, quat_wxyz, dyaw):
         """tool Z축 기준 dyaw 회전 (대칭 그리퍼 등가 파지)"""
         Rn = self._quat_to_rotm(quat_wxyz) @ np.array([
@@ -750,17 +569,15 @@ class ArmControllerNode(Node):
 
     # ── Doosan 실행 ───────────────────────────────────────────
 
-    def execute_spline(self, traj_rad, vel_scale: float = 1.0):
+    def execute_spline(self, traj_rad):
         if not self.cli_spline.wait_for_service(timeout_sec=3.0):
             self.get_logger().error("MoveSplineJoint 서비스 없음")
             return
         traj_deg = np.rad2deg(traj_rad)
         n = traj_deg.shape[0]
-        # dense 한 cuRobo interpolated plan(수십~수백 pt)을 듬성하게 → 스플라인이 빠르게 통과.
-        _maxpt = int(os.environ.get('CUROBO_SPLINE_MAXPT', '25'))
-        if n > _maxpt:
-            traj_deg = traj_deg[np.linspace(0, n - 1, _maxpt, dtype=int)]
-            n = _maxpt
+        if n > 100:
+            traj_deg = traj_deg[np.linspace(0, n - 1, 100, dtype=int)]
+            n = 100
 
         req = MoveSplineJoint.Request()
         req.pos_cnt = n
@@ -768,47 +585,20 @@ class ArmControllerNode(Node):
             pt = Float64MultiArray()
             pt.data = row.tolist()
             req.pos.append(pt)
-        req.vel = [float(os.environ.get('CUROBO_SPLINE_VEL', '70')) * self.VEL_SCALE] * 6
-        req.acc = [float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE] * 6
+        req.vel = [30.0 * self.VEL_SCALE] * 6
+        req.acc = [60.0] * 6
         req.time = 0.0; req.mode = 0; req.sync_type = 0
-
-        # 궤적 총 이동량(최대 관절 arc)으로 실행 시간 추정 → 여유 2배 + 10s
-        arc = float(np.abs(np.diff(traj_deg, axis=0)).sum(axis=1).max()) if n > 1 else 0.0
-        spline_timeout = max(60.0, arc / max(vel_deg, 1.0) * 2.0 + 10.0)
 
         self.get_logger().info(
             f"Spline 실행 ({n}pts) "
             f"start={[f'{v:.1f}' for v in traj_deg[0]]} "
-            f"end={[f'{v:.1f}' for v in traj_deg[-1]]} "
-            f"vel={vel_deg:.1f}°/s timeout={spline_timeout:.0f}s")
+            f"end={[f'{v:.1f}' for v in traj_deg[-1]]}")
         future = self.cli_spline.call_async(req)
-        # 이 로봇은 MoveSplineJoint 응답 future 가 안 오는 경우가 많음(모션은 실행됨).
-        # 그래서 future OR 실제 관절도달(joint_states) 둘 중 하나로 성공 판정.
-        target = np.asarray(traj_rad[-1], dtype=float)
         t0 = time.time()
-        reached = False
-        last_log = 0.0
-        while time.time() - t0 < 45.0:
-            if future.done() and future.result() and future.result().success:
-                reached = True
-                break
-            cj = self.current_joints
-            if cj is not None:
-                err = float(np.max(np.abs(np.asarray(cj, dtype=float) - target)))
-                if err < np.radians(3.5):
-                    reached = True
-                    break
-                # 5초마다 진행상황 (멈췄나 진행중인가 판별용)
-                if time.time() - t0 - last_log > 5.0:
-                    last_log = time.time() - t0
-                    self.get_logger().info(
-                        f"  스플라인 진행중... 도달오차 {np.degrees(err):.1f}° ({last_log:.0f}s)")
-            time.sleep(0.1)
-        self.get_logger().info(
-            "Spline " + ("완료" if reached else "실패(미도달)") +
-            (f" (도달오차 {np.degrees(np.max(np.abs(np.asarray(self.current_joints, dtype=float)-target))):.1f}°)"
-             if self.current_joints is not None else ""))
-        return reached
+        while not future.done() and (time.time() - t0) < 30.0:
+            time.sleep(0.05)
+        ok = future.done() and future.result() and future.result().success
+        self.get_logger().info("Spline " + ("완료" if ok else "실패"))
 
     def _execute_movej(self, joints_deg, vel: float = 30.0, acc: float = 30.0) -> bool:
         if not self.cli_movej.wait_for_service(timeout_sec=3.0):
