@@ -501,6 +501,11 @@ try:
     _MOVEJOINT_AVAIL = True
 except Exception:
     _MOVEJOINT_AVAIL = False
+try:
+    from dsr_msgs2.srv import MoveStop   # 스페이스바 비상정지 (Quick stop)
+    _MOVESTOP_AVAIL = True
+except Exception:
+    _MOVESTOP_AVAIL = False
 
 # GraspGen ZMQ 클라이언트 (object_tracking 워크플로우 이식). ~/GraspGen path 추가.
 _GG_ROOT = os.path.expanduser("~/GraspGen")
@@ -867,6 +872,12 @@ class WebcamSegNode(Node):
         if _MOVEJOINT_AVAIL:
             self.cli_product_view = self.create_client(
                 MoveJoint, '/dsr01/motion/move_joint', callback_group=cb_group)
+        # 🛑 비상정지 (스페이스바) — 두산 MoveStop(Quick stop). 물리 E-stop 의 보조.
+        self.cli_stop = None
+        if _MOVESTOP_AVAIL:
+            self.cli_stop = self.create_client(
+                MoveStop, '/dsr01/motion/move_stop', callback_group=cb_group)
+        self._estop_last = 0.0
         _hp = os.environ.get('WSN_PRODUCT_VIEW', '0.0,-36.0,56.0,5.0,110.0,0.0')
         self.product_view_pose  = [float(v) for v in _hp.split(',')]
         self._product_view_last = 0.0
@@ -942,8 +953,32 @@ class WebcamSegNode(Node):
         except Exception as e:
             self.get_logger().error(f'product_view 이동 실패: {e}')
 
+    def _emergency_stop(self):
+        """🛑 스페이스바 비상정지 — 두산 MoveStop(Quick stop). 디바운스 0.3s.
+        ※ 물리 E-stop(TP 빨간버튼)이 1순위. 이건 소프트 보조."""
+        now_ = time.time()
+        if now_ - self._estop_last < 0.3:
+            return
+        self._estop_last = now_
+        if self.cli_stop is None:
+            self.get_logger().error('🛑 비상정지 서비스 없음 (dsr_msgs2/MoveStop) — 물리 E-stop 사용!')
+            return
+        try:
+            req = MoveStop.Request()
+            req.stop_mode = 1   # DR_QSTOP : Quick stop
+            self.cli_stop.call_async(req)
+            self.get_logger().warn('🛑🛑🛑 [SPACE] 비상정지 — MoveStop(QSTOP) 호출됨')
+        except Exception as e:
+            self.get_logger().error(f'🛑 비상정지 호출 실패: {e} — 물리 E-stop 사용!')
+
     def _on_key_press(self, key):
-        # (스페이스바 비상정지 제거됨 — 사용자 요청)
+        # 스페이스바 = 비상정지 (OS레벨 — 창 포커스 무관하게 즉시 작동)
+        try:
+            if key == pynput_keyboard.Key.space:
+                self._emergency_stop()
+                return
+        except Exception:
+            pass
         c = self._normalize(key)
         # ('h' product_view는 cv2.waitKey 핸들러에서만 처리 — 여기서 또 하면 move_joint 이중발사
         #  → 충돌로 로봇이 엉뚱한 자세(하늘)로 감. OS레벨 중복 금지.)
@@ -1821,12 +1856,15 @@ class WebcamSegNode(Node):
         self._publish_obstacles(self._selected())
         time.sleep(0.3)
         # 프리그래스프 = 캔중심에서 (그리퍼길이+standoff) 만큼 approach 반대로 뒤.
-        pre = (np.asarray(C)
+        pre = (np.asarray(C, dtype=float)
                - (self.gripper_offset + self.pregrasp_standoff) * np.asarray(approach))
+        # s 이동 시 base X축 추가 오프셋 (사용자 요청 +3cm). 조정: WSN_S_X_OFFSET (m)
+        _sxo = float(os.environ.get('WSN_S_X_OFFSET', '0.03'))
+        pre[0] += _sxo
         msg = self._pose_msg(pre, quat)
         self.pub_target.publish(msg)          # 이동 전용 토픽
         self.get_logger().info(
-            f"[s] 프리그래스프(캔중심-{(self.gripper_offset+self.pregrasp_standoff)*100:.0f}cm·approach) "
+            f"[s] 프리그래스프(캔중심-{(self.gripper_offset+self.pregrasp_standoff)*100:.0f}cm·approach, +X{_sxo*100:.0f}cm) "
             f"→ ({pre[0]*1000:.0f},{pre[1]*1000:.0f},{pre[2]*1000:.0f})mm "
             f"[캔중심 {C[0]*1000:.0f},{C[1]*1000:.0f},{C[2]*1000:.0f}]")
         return True
@@ -1846,11 +1884,14 @@ class WebcamSegNode(Node):
             self.get_logger().info(f"[p] 파지 클래스 발행: {_sel['name']}")
         time.sleep(0.3)
         # 집기: 그리퍼밑동 = 캔중심 - 그리퍼길이*approach (손가락이 캔중심에 닿음).
-        adv = np.asarray(C) - self.gripper_offset * np.asarray(approach)
+        adv = np.asarray(C, dtype=float) - self.gripper_offset * np.asarray(approach)
+        # base X축 추가 오프셋 — s(프리그래스프)와 동일하게 적용 (최종 파지점도 +X)
+        _sxo = float(os.environ.get('WSN_S_X_OFFSET', '0.03'))
+        adv[0] += _sxo
         msg = self._pose_msg(adv, quat)
         self.pub_pick.publish(msg)
         self.get_logger().info(
-            f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach) → /dsr01/curobo/pick_pose "
+            f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach, +X{_sxo*100:.0f}cm) → /dsr01/curobo/pick_pose "
             f"({adv[0]*1000:.0f},{adv[1]*1000:.0f},{adv[2]*1000:.0f})mm (이후 15cm 수직 lift)")
         self.clear_grasp_preview()
         return True
@@ -3740,7 +3781,7 @@ class WebcamSegNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 200, 255) if armed else (0, 255, 0), 2)
                 cv2.putText(vis,
-                            'h=HOME(scout)  1-9=lock  g=graspgen  s=move  p=advance+grasp  r=cancel  q=quit',
+                            'SPACE=E-STOP  h=HOME(scout)  1-9=lock  g=graspgen  s=move  p=advance+grasp  r=cancel  q=quit',
                             (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                             (0, 0, 255), 1)
 
@@ -3751,6 +3792,8 @@ class WebcamSegNode(Node):
                     interpolation=cv2.INTER_LINEAR)
                 cv2.imshow(self.win, vis_show)
                 k = cv2.waitKey(1) & 0xFF
+                if k == 32:   # 🛑 스페이스바 = 비상정지 (창 포커스 시 백업; pynput 이 OS레벨 주)
+                    self._emergency_stop()
                 if k == 27 or (k == ord('q') and '`' not in self.keys_held):
                     break
                 # ── object_tracking 식 키: 1-9 lock / p pick / r cancel ──

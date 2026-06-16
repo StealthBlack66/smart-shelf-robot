@@ -192,8 +192,10 @@ class ArmControllerNode(Node):
     # ── 초기화 헬퍼 ───────────────────────────────────────────
 
     def _find_config_dir(self):
+        # __file__ = src/motion/curobo_planner_node.py → 3단계 위가 패키지 루트
+        # (src/config 가 아니라 패키지루트/config). 그래야 grasp_force_params.yaml 도 로드됨.
         local = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
             "config", "curobo")
         if os.path.exists(local):
             return local
