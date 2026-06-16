@@ -22,7 +22,7 @@ pynput==1.8.2
 #   외곽 워커 우선순위: HQ-SAM > SAM2 > ISNet (앞엣것 있으면 그걸 씀)
 #   ▸ GPU 있음 → SAM2 가 외곽선 담당 (가장 tight). ENABLE_SAM2=1 필수.
 #   ▸ GPU 없음 → ISNet(CPU) fallback. 거칠지만 동작.
-SAM-2==1.0            # import 명 sam2. SAM2 정밀 외곽 (models/sam2_hiera_large.pt 번들, 898MB). GPU 필요
+sam2==1.1.0           # import 명 sam2. SAM2 정밀 외곽 (models/sam2_hiera_large.pt 번들, 898MB). GPU 필요
 rembg==2.0.69         # ISNet fallback (models/isnet-general-use.onnx 번들, 170MB). CPU
 onnxruntime==1.23.2   # rembg 백엔드
 

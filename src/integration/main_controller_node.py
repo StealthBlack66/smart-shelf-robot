@@ -26,20 +26,6 @@ class TaskState:
     ERROR                = 'error'
 
 
-# 물체 클래스별 목표전류 (mA)
-CURRENT_MAP = {
-    'can':      800.0,
-    'bottle':   400.0,
-    'snack_bag': 200.0,
-}
-
-MAX_CURRENT_MAP = {
-    'can':      1000.0,
-    'bottle':    600.0,
-    'snack_bag': 300.0,
-}
-
-
 class MainControllerNode(Node):
     def __init__(self):
         super().__init__('main_controller_node')
