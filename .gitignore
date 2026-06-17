@@ -21,3 +21,6 @@ src/custom/rl/checkpoints/
 
 # Isaac Lab & Physical AI Core
 third_party/
+
+# Miniconda installer
+Miniconda3-latest-Linux-x86_64.sh

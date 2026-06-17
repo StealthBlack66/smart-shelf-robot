@@ -1,0 +1,1061 @@
+﻿Isaac Lab Franka 로봇 실습 가이드 수정 방안 검토
+by Copilot M365
+문서를 전체적으로 검토해보면, 이미 개념 + 코드 스켈레톤 + 실행 명령어까지 잘 포함된 “상급자용 개요 가이드”입니다. 다만 실제 실습 관점에서는 다음이 부족합니다:
+* “왜 이 값을 쓰는지”에 대한 기준
+* “실제로 실행하면서 무엇을 확인해야 하는지”
+* “어디서 실패하는지와 즉시 수정법”
+* “초보자가 바로 적용 가능한 기본 세팅값”
+아래는 각 파트별로 ‘실행 관점에서 부족한 부분’을 보강한 내용입니다.
+✅ 1. Custom RL Environment Design 보강
+📌 기존 한계 :  단순 코드 작성 중심 → “환경이 제대로 구성되었는지 검증 기준 부족”
+🔧 보강 실행안
+(1) 환경 생성 후 반드시 해야 할 체크
+python scripts/random_agent.py --task=Template-MyCustomTask-v0 --num_envs=4
+👉 여기서 반드시 확인
+* 로봇 base 위치 (테이블 위인지)
+* 큐브 위치 (reachable 영역인지)
+* 로봇이 움직일 때 관통/튐 현상 없는지
+👉 실패 시 수정 포인트
+* init_state.pos (큐브 위치) [[정리]Isaac...로봇 실습 가이드 | Word]
+* FRANKA_PANDA_CFG.replace() 위치 오프셋 [[정리]Isaac...로봇 실습 가이드 | Word]
+(2) 환경 안정성 체크
+👉 random agent 기준으로
+* 큐브가 튀면 → mass / friction 문제
+* 로봇이 떨면 → damping 문제
+👉 수정 위치 : RigidObjectCfg (mass, rigid_props) [[정리]Isaac...로봇 실습 가이드 | Word]
+✅ 핵심 추가 팁
+👉 “처음엔 환경을 단순화”
+* 큐브 1개
+* 테이블 하나
+* 중력 유지
+→ 복잡하게 시작하면 학습 실패 확률 ↑
+✅ 2. Reward Engineering 보강 (핵심)
+📌 기존 한계 :  수식 설명 중심 → 실제 튜닝 전략 부족
+🔧 보강 실행 Step-by-step
+✅ Step 1: 최소 보상부터 시작
+distance_reward only
+👉 절대 하지 말 것: 처음부터 grasp, penalty 다 넣기 ❌
+✅ Step 2: 보상 값 스케일 맞추기
+현재 문서:
+* dist ~ [0,1]
+* penalty ~ [-0.01]
+👉 추가 기준:
+✔ 목표
+* 성공 시 총 보상 ≈ 1~10
+* 실패 시 ≈ 0
+✅ Step 3: sigma 튜닝 방법
+문서 설명 있음 [[정리]Isaac...로봇 실습 가이드 | Word]
+👉 실전 방법:
+상황
+	조치
+	근처 못 감
+	sigma ↑
+	근처에서 빙빙
+	sigma ↓
+	
+
+✅ Step 4: Reward 로그 직접 찍기 (추가 필요)
+print(dist.mean(), action_penalty.mean())
+👉 이유
+TensorBoard만 보면 늦음
+✅ Step 5: reward breakdown 시각화
+→ 반드시 해야 하는 작업 (문서에 약함)
+tensorboard --logdir=logs/skrl/
+👉 확인 포인트
+* dist reward만 증가하는지
+* penalty가 reward를 잡아먹는지
+🚨 핵심 디버깅 패턴
+증상
+	원인
+	해결
+	가만히 있음
+	penalty 과대
+	weight ↓
+	빠르게 흔들림
+	penalty 부족
+	weight ↑
+	목표 근처 못 감
+	sigma 너무 작음
+	↑
+	목표 주변만 맴돎
+	shaping 부족
+	추가 reward
+	✅ 3. Curriculum Learning 보강
+📌 기존 한계: step 수 제시되지만 “전환 기준 없음”
+🔧 보강 실행 기준
+✅ 단계 전환 기준 정의 필수
+Reach → Lift 이동 조건: 성공률 70% 이상
+👉 측정 방법  : 최근 100 episode 평균
+✅ 체크포인트 기반 전환
+best_agent.pt → 다음 task 초기화
+✅ warm-start 방식 추가
+👉 Lift 시작 시
+* policy weight 그대로 사용 ✔
+* critic reset 권장
+🚨 실패 패턴 보강
+문제
+	해결
+	Lift 처음부터 실패
+	Reach policy 사용
+	Stack 진입 못함
+	cube 거리 줄이기
+	✅ 4. Multi-Stage Decomposition 보강
+📌 기존 한계 : 설계는 좋지만 “디버깅 난이도 매우 높음”
+🔧 보강 실행 전략
+✅ 반드시 Stage별 로그 분리
+log: stage1_reward
+log: stage2_reward
+✅ gating 상태 로그 출력
+print(is_grasped.sum())
+👉 이유
+* 현재 stage 진입 여부 확인 필수
+✅ 초기 개발 방법 (중요)
+한 번에 5 stage ❌
+👉 순서:
+1. Reach만 구현
+   * Grasp
+   * Lift
+   * Move
+   * Stack
+🚨 대표 실패 원인
+원인
+	해결
+	stage2 안 열림
+	grasp 조건 완화
+	stage3 안 열림
+	lift threshold 낮추기
+	학습 멈춤
+	reward gating 깨짐
+	✅ 5. SKRL & Gym 연동 보강
+📌 기존 한계
+* 코드 설명 있음 → 실제 오류 대응 없음
+🔧 필수 점검 포인트
+✅ env shape 확인
+print(env.observation_space)
+print(env.action_space)
+✅ wrapping 확인
+env = SkrlVecEnvWrapper(env)
+빠지면 학습 안 됨 [[정리]Isaac...로봇 실습 가이드 | Word]
+✅ dtype 문제 체크
+👉 반드시
+* torch.float32 유지
+________________
+
+
+🚨 흔한 실패
+문제
+	원인
+	NaN 발생
+	reward 폭주
+	학습 안 됨
+	action scale mismatch
+	crash
+	device mismatch
+	________________
+
+
+✅ 6. GPU Accelerated Simulation 보강
+📌 기존 한계
+* 이론 설명 충분 → 실전 튜닝 부족
+________________
+
+
+🔧 실전 튜닝 기준
+✅ num_envs 자동 튜닝법
+16 → 32 → 64 → crash 직전까지
+________________
+
+
+✅ 성능 지표
+항목
+	정상
+	GPU util
+	80~95%
+	VRAM
+	70~90%
+	________________
+
+
+✅ 속도 최적화 순서
+1. headless ✔
+2. num_envs 증가 ✔
+3. reward GPU-only 확인 ✔
+________________
+
+
+✅ 7. Checkpoint & Versioning 보강
+📌 기존 한계
+* 저장 구조 설명 OK → 실전 운영 부족
+________________
+
+
+🔧 실전 운영 방식
+✅ best vs last 구분 필수
+파일
+	용도
+	best_agent
+	최종 모델
+	agent_xxxxx
+	디버깅
+	________________
+
+
+✅ 저장 전략
+save_interval = 2000
+👉 이유 :  빠르게 rollback 가능
+✅ 실험 관리 추천 방식
+폴더명:
+run_lr3e4_sigma0.1_penalty0.01
+
+✅ 실패 복구 전략
+--resume + checkpoint
+[[정리]Isaac...로봇 실습 가이드 | Word]
+🔥 전체 핵심 개선 요약
+문서를 실제 실행형으로 업그레이드하려면 반드시 추가해야 할 것
+✅ 1. Debug 루틴
+* reward 분해 로그
+* stage 진입 로그
+* tensorboard 분석
+✅ 2. 튜닝 기준 명문화
+* sigma tuning rule
+* penalty 비율
+* success threshold
+✅ 3. 단계별 개발 전략
+* 한 번에 구현 ❌
+* incremental build ✔
+✅ 4. 실패 패턴 대응표 → 이게 실제 성능 개선의 핵심
+👉 결론
+현재 문서는 **“좋은 아키텍처 가이드”**이고,
+여기에 위 보강을 적용하면 “실제 연구/실습 가능한 실행 매뉴얼” 수준으로 올라갑니다.
+필요하시면
+👉 “실제 Franka Lift가 수렴 안 될 때 디버깅 순서”
+👉 “보상 함수 템플릿 (바로 사용 가능)”
+까지 더 구체적으로 만들어 드릴게요.
+________________
+
+
+좋습니다. 
+이건 실제 현장에서 가장 많이 막히는 구간이라, 단순 설명이 아니라
+👉 “실제로 바로 따라할 수 있는 디버깅 순서 (우선순위 기반)”로 정리해 드리겠습니다.
+Franka Lift 수렴 실패 디버깅 순서 (실전 체크리스트)
+👉 핵심 원칙: “보상 → 관측 → 액션 → 물리 → 학습 파라미터 순으로 확인”
+✅ 0단계: 증상 먼저 분류 (중요)
+먼저 현재 상태를 정확히 규정해야 합니다.
+증상
+	의미
+	움직이지 않음
+	reward/penalty 문제
+	큐브 근처 안 감
+	reward shaping 문제
+	잡기 직전 멈춤
+	grasp 조건 문제
+	잡자마자 떨어짐
+	물리 or reward 문제
+	계속 흔들림
+	action penalty 부족
+	학습이 전혀 증가 안 함
+	전체 구조 문제
+	👉 아래 단계는 이 기준으로 진행
+✅ 1단계: Reward sanity check (가장 먼저)
+🔍 바로 확인
+python scripts/zero_agent.py --task=Template-Lift-v0
+👉 체크:
+* 아무 행동 안 해도 큰 음수 나오면 ❌
+* reward가 계속 떨어지면 ❌
+👉 정상
+* reward ≈ 0 근처 유지
+🔍 reward 출력 직접 확인
+print(dist.mean(), action_penalty.mean())
+👉 꼭 확인
+* dist reward > penalty 인가?
+* penalty가 전체를 잡아먹지 않는가?
+✅ 빠른 수정 기준
+문제
+	해결
+	가만히 있음
+	penalty ↓
+	reward 음수
+	penalty 10배 줄이기
+	학습 멈춤
+	reward scale ↑
+	✅ 2단계: Distance reward 동작 검증
+👉 핵심:  “로봇이 큐브 쪽으로 가도록 유도되는지”
+🔍 테스트 방법
+python scripts/random_agent.py --task=Template-Lift-v0
+👉 관찰:
+* 큐브 방향으로 조금이라도 가면 OK
+* 완전히 랜덤이면 reward 실패
+✅ 해결 방법
+👉 distance 함수 튜닝
+exp(-d^2 / sigma^2)
+σ 튜닝 규칙
+상황
+	조치
+	큐브 안 감
+	sigma ↑ (0.2)
+	주변에서 돌기만
+	sigma ↓ (0.05)
+	✅ 3단계: Observation 문제 체크 (숨은 핵심)
+👉 Lift에서 제일 많이 터지는 부분
+🔍 체크 코드
+print(obs.mean(), obs.std())
+👉 문제 상황
+* 값 너무 큼 (10 이상) ❌
+* 값 거의 0 ❌
+✅ 수정 방법
+normalize 필수
+joint_pos / pi
+joint_vel / max_vel
+✅ 핵심 체크
+👉 큐브 위치 vs EE 위치가 상대좌표인지 확인
+✔ 좋음: cube_pos - ee_pos
+❌ 나쁨: absolute coordinate
+✅ 4단계: Action space 문제
+👉 Lift 실패의 30%가 여기서 발생
+🔍 체크
+* action scale 너무 큼?
+* 로봇 갑자기 튐?
+✅ 수정
+액션 스케일 줄이기
+action_scale = 0.25
+✅ 그리퍼 동작 필수 확인
+👉 체크: open / close 실제 동작하는가?
+👉 실패 원인: 그리퍼 action 연결 안 됨
+✅ 5단계: Grasp 실패 디버깅 (핵심 병목)
+🔍 체크
+print(is_grasped.sum())
+👉 항상 0이면 문제
+✅ 해결 방법
+1. 조건 완화
+0.03 < gripper_width < 0.08
+(문서보다 넓게 시작)
+________________
+
+
+2. 보너스 추가
+if grasped:
+        reward += 2.0
+________________
+
+
+3. cube 위치 낮추기
+z = 0.02
+________________
+
+
+✅ 6단계: 물리(Physics) 문제
+________________
+
+
+🔍 체크
+* 큐브 미끄러짐?
+* 잡자마자 튕김?
+________________
+
+
+✅ 해결
+friction 증가
+static_friction = 1.0
+dynamic_friction = 0.8
+________________
+
+
+mass 조정
+mass = 0.05 ~ 0.2
+________________
+
+
+✅ 7단계: Curriculum 강제 적용
+👉 Lift는 단독으로 학습시키면 실패 많음
+________________
+
+
+✅ 해결
+방법 1: Reach 모델 사용
+--checkpoint reach_model.pt
+________________
+
+
+방법 2: 초기 위치 제한
+cube near gripper
+________________
+
+
+✅ 8단계: 학습 파라미터 점검
+________________
+
+
+🔍 체크
+항목
+	값
+	learning rate
+	3e-4
+	num_envs
+	32~64
+	rollout_steps
+	24
+	________________
+
+
+✅ 증상별 대응
+문제
+	해결
+	학습 느림
+	num_envs ↑
+	발산
+	lr ↓ (1e-4)
+	정체
+	entropy ↑
+	________________
+
+
+✅ 9단계: TensorBoard로 최종 확인
+tensorboard --logdir=logs/skrl/
+________________
+
+
+🔍 정상 패턴
+항목
+	정상
+	dist reward
+	먼저 상승
+	grasp reward
+	중간에 상승
+	total reward
+	점진 상승
+	________________
+
+
+🚨 이상 패턴
+상황
+	원인
+	전부 0
+	reward broken
+	penalty만 증가
+	weight 오류
+	grasp 안 뜸
+	condition 실패
+	✅ 10단계: 가장 빠른 해결 전략 (실전 핵심)
+👉 현업에서 가장 많이 쓰는 방법
+🚀 “단순화 → 다시 복잡화”
+1단계
+* reward = distance only
+* cube 가까이
+* grasp 없음
+2단계
+* grasp 추가
+* bonus 추가
+3단계
+* lift 추가
+👉 절대 금지 : 처음부터 full lift 설계 ❌
+🔥 최종 요약 (가장 중요 5가지)
+👉 Lift 안 되는 원인의 90%
+1. reward scale 문제
+2. sigma 문제
+3. grasp 조건 문제
+4. observation scaling 문제
+5. action scale 문제
+🚀 추천 디버깅 루틴 (30분 컷)
+1. zero_agent 확인
+2. distance reward만 남기기
+3. sigma 튜닝
+4. obs normalize
+5. grasp 조건 완화
+6. TensorBoard 확인
+👉 필요하면: “Lift가 잡긴 잡는데 못 들어올릴 때” “계속 미끄러질 때” 같은 정체 패턴별 해결 템플릿도 만들어 드릴게요.
+________________
+
+
+by ChatGPT
+실제 Franka Lift(Task: Reach → Grasp → Lift) 가 수렴하지 않을 때는 보상함수만 계속 수정하기보다, 환경 → 물리 → 관측 → 행동 → 보상 → RL 하이퍼파라미터 순으로 점검하는 것이 훨씬 효율적입니다.
+첨부하신 가이드에서도 Lift는 Reach 이후의 커리큘럼으로 설계되어 있으며, Reach가 충분히 안정화된 후 Lift를 학습하는 것을 권장하고 있습니다.
+0단계. 가장 먼저 확인할 것
+Reach는 이미 성공하는가?
+Lift는 사실 다음 세 가지가 연속으로 성공해야 합니다.
+Reach
+   ↓
+Grasp
+   ↓
+Lift
+만약 Reach 자체가 불안정하면 Lift는 거의 수렴하지 않습니다.
+GUI에서 확인
+python scripts/skrl/play.py \
+--task=Template-Reach-Play-v0 \
+--checkpoint=<best_agent.pt>
+체크 항목
+* EE(End Effector)가 큐브 중심으로 이동하는가
+* 목표 주변에서 떨리지 않는가
+* 큐브를 지나쳐서 계속 흔들리지 않는가
+1단계. 환경(Environment) 디버깅
+(1) 큐브 위치 확인
+GUI에서 다음을 확인합니다.
+Robot Base
+      |
+      |
+     EE
+
+
+         Cube
+확인사항
+* 큐브가 작업공간 안에 있는가
+* Franka 팔 길이로 도달 가능한가
+* 테이블에 묻혀 있지 않은가
+가이드에서도 큐브 초기 위치를 명확히 정의하도록 구성되어 있습니다.
+________________
+
+
+(2) Random Agent 실행
+python scripts/random_agent.py \
+--task=Template-Lift-v0 \
+--num_envs=4
+확인
+* 시뮬레이션이 정상 동작하는가
+* 큐브가 중력에 의해 떨어지는가
+* 충돌이 정상인가
+________________
+
+
+2단계. Zero Agent 검사
+가이드에서도 매우 추천하는 방법입니다.
+python scripts/zero_agent.py \
+--task=Template-Lift-v0 \
+--num_envs=4
+
+________________
+여기서 확인
+아무 행동도 안 했는데
+Reward = -50
+같은 결과가 나오면
+* 패널티가 너무 큼
+* 초기 자세가 잘못됨
+* Joint limit에 걸림
+* Action penalty가 과도함
+을 의미합니다.
+________________
+
+
+3단계. Observation 확인
+관측값이 잘못되면 절대 학습되지 않습니다.
+출력
+print(obs.shape)
+print(obs[0])
+확인
+joint_pos
+joint_vel
+ee_pos
+cube_pos
+gripper_state
+체크
+* NaN 없음
+* Inf 없음
+* 값이 계속 변하는가
+* 단위가 정상인가
+예
+cube_pos = [0,0,0]
+만 계속 나오면 센서 오류입니다.
+________________
+
+
+4단계. Action 확인
+정책이 실제 로봇으로 전달되는지 확인
+print(actions[0])
+예
+[0.1
+-0.2
+0.05
+...
+]
+확인
+* Action clipping
+* Joint limit
+* Scale factor
+예를 들어
+action_scale=0.01
+이면 거의 움직이지 않을 수 있습니다.
+________________
+
+
+5단계. Reward 분해
+가장 중요한 단계입니다.
+가이드에서도 Reward 항목별 TensorBoard 추적을 권장합니다.
+________________
+
+
+Reward를 모두 출력
+Reach reward
+
+
+Grasp reward
+
+
+Lift reward
+
+
+Action penalty
+
+
+Joint penalty
+
+
+Total reward
+예
+Reach = 0.8
+
+
+Grasp = 0
+
+
+Lift = 0
+
+
+Penalty = -2
+
+
+Total = -1.2
+그러면
+문제는
+Penalty > Positive reward
+입니다.
+________________
+
+
+Frozen Policy 확인
+가이드에서도 경고하는 부분입니다.
+Positive = +1
+Penalty = -5
+이면 로봇은 "안 움직이는 것이 이득" 이라고 학습합니다.
+6단계. Grasp 성공 여부
+Lift가 안 되는 가장 흔한 원인
+GUI로 확인
+접근 O
+그리퍼 닫힘 O
+큐브 잡힘 X
+원인
+* 마찰계수
+* 그리퍼 폭
+* 접촉 센서
+* grasp threshold
+Grasp Event 출력
+print(is_grasped)
+
+False
+False
+False
+False
+이면 Lift reward는 절대 활성화되지 않습니다.
+7단계. Curriculum 확인
+가이드에서는
+Reach
+↓
+Lift
+↓
+Stack
+순으로 학습하는 것을 권장합니다.
+Lift에서도 내부 커리큘럼 사용
+초기
+Reach reward = 1.0
+Lift reward = 0
+중기
+Reach reward = 1.0
+Grasp reward = 2.0
+후기
+Lift reward = 5.0
+이런 식으로 단계적으로 열리는 것이 좋습니다.
+8단계. TensorBoard 분석
+tensorboard --logdir=logs/skrl/
+확인
+정상
+Reward
+   /
+  /
+ /
+보상 정체
+--------
+→ 탐색 부족
+진동
+/\/\/\/\/\
+→ learning rate 과다
+갑자기 붕괴
+////
+   \
+    \
+→ PPO 불안정
+9단계. PPO 하이퍼파라미터
+초기 디버깅용 추천
+learning_rate = 3e-4
+entropy = 0.001
+clip = 0.2
+gamma = 0.99
+gae_lambda = 0.95
+가이드에서도 유사한 PPO 기본 설정을 사용하고 있습니다.
+10단계. GPU 병목 확인
+watch -n 0.5 nvidia-smi
+확인
+GPU Util
+
+
+VRAM
+가이드에서도 GPU 사용률이 매우 낮으면 Python 루프나 CPU 변환 코드가 병목일 가능성을 지적하고 있습니다.
+실제 현업에서 사용하는 Franka Lift 디버깅 우선순위
+순위
+	점검
+	1
+	GUI에서 Reach 동작 확인
+	2
+	Random Agent 실행
+	3
+	Zero Agent 실행
+	4
+	Observation NaN 검사
+	5
+	Action 전달 확인
+	6
+	Reward 항목별 출력
+	7
+	Grasp Event 확인
+	8
+	TensorBoard 분석
+	9
+	PPO 하이퍼파라미터 조정
+	10
+	GPU 병목 확인
+	
+
+Isaac Lab에서 실제로는 수렴 실패의 약 70~80%가 Reward 설계 문제가 아니라 "Grasp 이벤트가 발생하지 않거나 Stage 전환 조건이 너무 엄격한 것" 때문에 발생하는 경우가 많습니다. 따라서 Lift가 안 될 때는 **"그리퍼가 실제로 큐브를 잡았는가?"와 "Lift 보상이 활성화되는 조건이 충족되는가?"를 가장 먼저 확인하는 것이 효과적입니다.
+________________
+
+
+Lift가 안 될 때는 "그리퍼가 실제로 큐브를 잡았는가?"와 "Lift 보상이 활성화되는 조건이 충족되는가?"를 가장 먼저 확인하는 방법을 구체적으로 안내해주세요
+________________
+
+
+실제 Isaac Lab에서 Franka Lift가 수렴하지 않을 때, 현업에서는 "PPO를 의심하기 전에 Grasp Detection과 Lift Reward Trigger를 먼저 검증" 합니다.
+많은 경우 TensorBoard에서는 Reward가 정체되어 있는데, 실제 원인은
+EE 접근 성공
+   ↓
+그리퍼 닫힘
+   ↓
+실제로는 큐브를 못 잡음
+   ↓
+is_grasped=False
+   ↓
+Lift Reward 영원히 0
+   ↓
+학습 실패
+이기 때문입니다.
+첨부하신 가이드에서도 check_grasp_success() 이벤트 핸들러를 통해 파지 여부를 판정하고, 이 결과를 이용해 다음 Stage 보상을 활성화하도록 설계하는 방식을 제안하고 있습니다.
+________________
+
+
+1. GUI에서 먼저 눈으로 확인
+play 모드 실행
+python scripts/skrl/play.py \
+--task=Template-Lift-Play-v0 \
+--checkpoint=<best_agent.pt>
+또는
+python scripts/random_agent.py \
+--task=Template-Lift-v0 \
+--num_envs=1
+
+________________
+관찰해야 하는 것
+① EE가 큐브까지 오는가
+      EE
+
+
+       ●
+       │
+       │
+      □ Cube
+YES → 다음 단계
+NO → Reach 문제
+________________
+
+
+② 그리퍼가 닫히는가
+   |   |
+    \ /
+     □
+YES → 다음 단계
+NO → Action 문제
+________________
+
+
+③ 큐브가 손가락 사이에 끼는가
+좋은 경우
+   | □ |
+나쁜 경우
+   | |
+    □
+큐브가 빠져나간다면
+* friction
+* finger width
+* contact parameter
+문제일 가능성이 큽니다.
+________________
+
+
+2. is_grasped를 직접 출력
+Lift에서는 이것이 가장 중요합니다.
+예를 들어
+is_grasped = check_grasp_success(env)
+
+
+print(is_grasped)
+출력
+False
+False
+False
+False
+이면
+Lift Reward는 절대 발생하지 않습니다.
+________________
+
+
+병렬 환경에서는
+print(is_grasped[:10])
+예
+tensor([
+False,
+False,
+True,
+False,
+True,
+False,
+...
+])
+정상이라면 일부 환경에서는 True가 나와야 합니다.
+________________
+
+
+3. 그리퍼 폭(Gripper Width) 확인
+가이드의 예시도 그리퍼 폭으로 파지를 판단합니다.
+________________
+
+
+출력
+finger_pos = robot.data.joint_pos[:, 7:9]
+
+
+gripper_width = finger_pos[:,0] + finger_pos[:,1]
+
+
+print(gripper_width)
+예
+0.08
+0.07
+0.06
+0.05
+
+________________
+정상 범위
+예를 들어
+0.03 < width < 0.07
+이면
+큐브가 손가락 사이에 있음
+으로 판단할 수 있습니다.
+________________
+
+
+흔한 실수
+조건
+width < 0.02
+너무 엄격
+결과
+99% False
+
+________________
+4. 큐브 높이 출력
+Lift Reward는 대부분
+잡았다
++
+들어올렸다
+를 동시에 만족해야 합니다.
+________________
+
+
+출력
+cube_z = cube.data.root_pos_w[:,2]
+
+
+print(cube_z)
+예
+0.025
+0.024
+0.026
+계속 이렇다면
+큐브를 못 들고 있는 것입니다.
+________________
+
+
+Lift 성공
+0.025
+0.040
+0.080
+0.120
+0.150
+
+________________
+5. Lift Trigger 조건 출력
+예를 들어
+is_lifted = cube_z > 0.10
+
+
+print(is_lifted)
+
+________________
+흔한 문제
+실제
+cube_z=0.08
+인데
+조건
+cube_z > 0.15
+로 설정
+그러면
+False
+False
+False
+계속 유지됩니다.
+________________
+
+
+6. Reward를 분해해서 출력
+절대로 Total Reward만 보지 않습니다.
+________________
+
+
+예
+print(
+reach_reward,
+grasp_reward,
+lift_reward
+)
+출력
+0.92
+0
+0
+의미
+접근은 성공
+
+
+파지 실패
+
+________________
+또는
+0.95
+2.00
+0
+의미
+파지는 성공
+
+
+Lift Trigger 실패
+
+________________
+정상이라면
+0.95
+2.00
+5.00
+처럼 단계적으로 켜져야 합니다.
+________________
+
+
+7. TensorBoard에서 Stage별 Reward 보기
+tensorboard --logdir=logs/skrl/
+
+________________
+정상
+Reach
+    /
+   /
+  /
+
+
+Grasp
+      /
+     /
+    /
+
+
+Lift
+          /
+         /
+        /
+
+________________
+문제 1
+Reach ↑
+
+
+Grasp 0
+
+
+Lift 0
+→ 큐브를 못 잡음
+________________
+
+
+문제 2
+Reach ↑
+
+
+Grasp ↑
+
+
+Lift 0
+→ Lift 조건이 너무 엄격
+________________
+
+
+8. Stage Flag를 모두 출력
+실무에서는 이것이 가장 확실합니다.
+print(
+"reach :", reach_ok,
+"grasp :", is_grasped,
+"lift :", is_lifted,
+)
+출력
+reach : True
+grasp : True
+lift : False
+그러면
+문제는
+Lift Trigger
+입니다.
+
+
+9. GUI에 디버그 마커 표시
+Isaac Sim에서 추천하는 방법입니다.
+예를 들어
+Green Sphere = Grasp Success
+Red Sphere = Grasp Failure
+또는
+Cube Color
+Gray
+↓
+Yellow
+↓
+Green
+으로 Stage를 표시하면 원인을 매우 빨리 찾을 수 있습니다.
+10. 실제 현업 디버깅 체크리스트
+□ Reach 성공
+□ EE가 큐브 근처 도착
+□ 그리퍼 닫힘
+□ 큐브가 손가락 사이에 존재
+□ is_grasped=True 발생
+□ cube_z 증가
+□ is_lifted=True 발생
+□ lift_reward 활성화
+□ TensorBoard에서 Lift Reward 상승
+가장 추천하는 5분 디버깅 루틴
+1. GUI 실행
+2. print(is_grasped)
+3. print(cube_z)
+4. print(lift_reward)
+5. print(reach, grasp, lift flags)
+이 네 가지만 확인해도 "왜 Lift가 수렴하지 않는지"의 원인을 대부분 10분 이내에 특정할 수 있습니다.
+특히 Isaac Lab에서는 다음 한 줄이 가장 중요한 진단 지표입니다.
+Reach=True
+Grasp=True
+Lift=False
+이 상태라면 PPO나 신경망 문제가 아니라 Lift 보상 활성화 조건(Trigger Threshold)이 너무 엄격하거나 큐브 높이 판정 로직에 문제가 있을 가능성이 매우 높습니다.
