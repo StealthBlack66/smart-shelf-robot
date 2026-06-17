@@ -896,6 +896,10 @@ class WebcamSegNode(Node):
             QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                        history=HistoryPolicy.KEEP_LAST))   # latched — 늦게 붙는 RViz도 받음
         self.detections        = []
+        self.shelf_missing     = None   # 'v' 매대재고: 없는(집을) 제품 리스트
+        # 'v' 매대뷰(home) 자세 — 여기로 이동 후 매대재고 확인 (place_targets.yaml home)
+        self.shelf_view_pose   = [float(v) for v in os.environ.get(
+            'WSN_SHELF_VIEW', '-6.73,8.12,104.62,80.22,93.13,-23.49').split(',')]
         self.selected_idx      = 0
         self.locked            = False
         self.locked_idx        = None
@@ -1673,6 +1677,68 @@ class WebcamSegNode(Node):
         self.get_logger().info(
             f"[g] goalset 후보 {len(pa.poses)}개 발행 (/dsr01/curobo/grasp_candidates)")
 
+    def _go_shelf_and_check(self):
+        """'v' 키: home(매대뷰) 자세로 이동 → 도착 후 매대재고 확인.
+        디스플레이 안 멈추게 백그라운드 스레드에서 이동·대기."""
+        if self.cli_product_view is None:
+            self.get_logger().error('[v] move_joint 서비스 없음 — 브링업 확인'); return
+        if not self.cli_product_view.service_is_ready():
+            if not self.cli_product_view.wait_for_service(timeout_sec=0.5):
+                self.get_logger().error('[v] move_joint 서비스 미연결'); return
+
+        def _worker():
+            req = MoveJoint.Request()
+            req.pos = [float(v) for v in self.shelf_view_pose]
+            req.vel = 25.0; req.acc = 25.0; req.time = 0.0
+            req.radius = 0.0; req.mode = 0; req.blend_type = 0; req.sync_type = 1
+            self.get_logger().info(
+                f"[v] 매대뷰(home) 이동 → {[round(x,1) for x in self.shelf_view_pose]}°")
+            self.cli_product_view.call_async(req)
+            # ★도착 감지: 카메라 pose(eih T_cam2base)가 멈출 때까지 대기 (이동 끝난 후 확인).
+            #   고정 sleep 이 아니라 실제 정지 감지 — 이동 중 확인 방지.
+            time.sleep(1.0)   # 이동 시작 대기(출발 전 '정지'로 오판 방지)
+            t0 = time.time(); last = None; stable = 0
+            while time.time() - t0 < 20.0:
+                T = self.T_cam2base
+                if T is not None:
+                    p = np.asarray(T)[:3, 3].astype(float)
+                    if last is not None and np.linalg.norm(p - last) < 0.002:  # 2mm
+                        stable += 1
+                        if stable >= 8:        # ~0.8s 연속 정지 = 도착
+                            break
+                    else:
+                        stable = 0
+                    last = p
+                time.sleep(0.1)
+            self.get_logger().info("[v] 매대뷰 도착 — 매대재고 확인")
+            time.sleep(1.0)   # 영상/검출 안정
+            self.shelf_inventory_check()
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def shelf_inventory_check(self):
+        """'v' 키: 매대(홈뷰)에서 3종 제품(bottle/can/snack) present/absent 판정.
+        매대에 없는(검출 안 되는) 제품 = 바닥에서 집어야 할 것. conf threshold(WSN_SHELF_CONF,
+        기본 0.55)로 빈칸 구조물 오검출(보통 ~0.4) 제거 → 실제 제품(0.8+)만 present."""
+        thr = float(os.environ.get('WSN_SHELF_CONF', '0.55'))
+        with self.gd_lock:
+            dets = list(self.gd_results)
+        KW = {'bottle': ('bottle',), 'can': ('can',), 'snack': ('snack',)}
+        best = {k: 0.0 for k in KW}
+        for r in dets:
+            cls = str(r[4]).lower(); conf = float(r[5])
+            for k, kws in KW.items():
+                if any(w in cls for w in kws):
+                    best[k] = max(best[k], conf)
+        present = {k: (best[k] >= thr) for k in KW}
+        missing = [k for k in KW if not present[k]]
+        self.shelf_missing = missing
+        self.get_logger().info(
+            "[매대재고] " + "  ".join(
+                f"{k}={'O' if present[k] else 'X'}({best[k]:.2f})" for k in KW)
+            + f"  → 바닥에서 집을것={missing if missing else '없음(다 채워짐)'}")
+        return missing
+
     def send_graspgen(self):
         """'g' 키: 선택 물체 cloud(base,m) → GraspGen → best 6DOF 파지(오프셋 없는 '파지점').
         pending=(파지점pos, quat, 접근축) 저장 + RViz 미리보기 (로봇 안 움직임).
@@ -1872,9 +1938,36 @@ class WebcamSegNode(Node):
                                     int(np.percentile(sv, 95)))})
         return obs
 
+    def _dino_obstacles(self, exclude_xy=None, exclude_r=0.07):
+        """[WSN_ALL_DINO_OBS] DINO(gd_results)가 인식한 것 전부를 obstacle 로.
+        bbox 중심 depth→base 3D. 타깃(exclude_xy 반경) 만 제외."""
+        depth_arr = getattr(self, '_last_depth', None)
+        if depth_arr is None:
+            return []
+        with self.gd_lock:
+            dets = list(self.gd_results)
+        out = []
+        for d in dets:
+            try:
+                x1, y1, x2, y2, phrase, score = d[0], d[1], d[2], d[3], d[4], d[5]
+            except Exception:
+                continue
+            cu = int((float(x1) + float(x2)) / 2); cv = int((float(y1) + float(y2)) / 2)
+            xyz, _st = self.pixel_to_base_xyz(cu, cv, depth_arr)
+            if xyz is None:
+                continue
+            c = np.asarray(xyz, dtype=float).ravel() / 1000.0   # mm→m
+            if exclude_xy is not None and \
+               (c[0]-exclude_xy[0])**2 + (c[1]-exclude_xy[1])**2 < exclude_r**2:
+                continue                                          # 잡을 타깃은 장애물 아님
+            out.append({'name': 'dino:' + str(phrase).split()[0][:8],
+                        'pos': [float(c[0]), float(c[1]), float(c[2])],
+                        'dims': [0.08, 0.08, 0.15]})
+        return out
+
     def _publish_obstacles(self, exclude_det, log=True):
         """타깃(exclude_det) 제외한 물체를 curobo 장애물로 발행.
-        seg 검출(self.detections) + depth 클러스터(분류 무관) 합집합 → 누락 최소화."""
+        seg 검출(self.detections) + DINO 검출 전부(WSN_ALL_DINO_OBS) + depth 클러스터 합집합."""
         import json as _json
         obs = []
         ex_tk = exclude_det.get('_tk') if exclude_det else None
@@ -1906,11 +1999,20 @@ class WebcamSegNode(Node):
                            < 0.08 ** 2 for o in obs)
                 if not _dup:
                     obs.append(dob)
+        # ★DINO 가 인식한 것 전부를 obstacle 로 (사용자 요청). 기본 ON, 타깃 반경 제외.
+        if os.environ.get('WSN_ALL_DINO_OBS', '1') != '0':
+            _ex_xy = (float(ex_c[0]), float(ex_c[1])) if ex_c is not None else None
+            _nd = 0
+            for dob in self._dino_obstacles(exclude_xy=_ex_xy):
+                _p = dob['pos']
+                if not any((_p[0]-o['pos'][0])**2 + (_p[1]-o['pos'][1])**2 < 0.08**2
+                           for o in obs):
+                    obs.append(dob); _nd += 1
         m = String(); m.data = _json.dumps(obs)
         self.pub_obstacles.publish(m)
         if log:
             self.get_logger().info(
-                f"[obstacles] 장애물 {len(obs)}개 발행 (seg+depth, 타깃 제외)")
+                f"[obstacles] 장애물 {len(obs)}개 발행 (seg+DINO전부+depth, 타깃 제외)")
 
     def move_to_grasp(self):
         """'s' 키: GraspGen 파지점으로 '이동만' (그리퍼 안 닫음).
@@ -3847,9 +3949,22 @@ class WebcamSegNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 200, 255) if armed else (0, 255, 0), 2)
                 cv2.putText(vis,
-                            'SPACE=E-STOP  h=HOME(scout)  1-9=lock  g=graspgen  s=move  p=advance+grasp  r=cancel  q=quit',
+                            'SPACE=E-STOP  h=HOME  v=shelf-check  1-9=lock  g=graspgen  s=move  p=advance+grasp  r=cancel  q=quit',
                             (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                             (0, 0, 255), 1)
+                if self.shelf_missing is not None:
+                    _inv = ("SHELF: ALL STOCKED"
+                            if not self.shelf_missing
+                            else f"SHELF EMPTY -> PICK {len(self.shelf_missing)}: "
+                                 + ", ".join(self.shelf_missing))
+                    _ic = (0, 255, 0) if not self.shelf_missing else (0, 140, 255)
+                    # 배경 박스 + 큰 글씨로 눈에 띄게
+                    (_tw, _th), _ = cv2.getTextSize(
+                        _inv, cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2)
+                    cv2.rectangle(vis, (8, 84), (16 + _tw, 84 + _th + 14),
+                                  (0, 0, 0), -1)
+                    cv2.putText(vis, _inv, (12, 84 + _th + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.9, _ic, 2)
 
                 # 고정 1600x1200 으로 resize. 1280x720 입력 → 1.25배 upscale 이라
                 # INTER_LINEAR 로도 mosaic 없음 (FPS 우선).
@@ -3920,6 +4035,9 @@ class WebcamSegNode(Node):
                 if k == ord('g') and '`' not in self.keys_held:
                     # 'g': 선택 물체 GraspGen 추론 → RViz 미리보기 (로봇 안 움직임)
                     self.send_graspgen()
+                if k == ord('v') and '`' not in self.keys_held:
+                    # 'v': home(매대뷰)로 이동 → 매대재고 확인 (없는 제품 = 바닥에서 집을 것)
+                    self._go_shelf_and_check()
         finally:
             try:
                 self.key_listener.stop()
