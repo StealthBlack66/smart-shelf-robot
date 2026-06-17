@@ -1,0 +1,183 @@
+import { useTelemetry } from './hooks/useTelemetry'
+import { Panel, Pill, KV, Stat, Gauge } from './components/common'
+import { CurrentChart } from './components/CurrentChart'
+import { CameraFeed } from './components/CameraFeed'
+import { ControlPanel } from './components/ControlPanel'
+import { OperatorPanel } from './components/OperatorPanel'
+import { LogsPanel } from './components/LogsPanel'
+import { api } from './api'
+import type { Snapshot } from './types'
+
+const JOINT_LIMIT_DEG = 360 // 바 정규화용(시각화 한도)
+
+function ConnectionPanel({ s }: { s: Snapshot }) {
+  const c = s.connections
+  return (
+    <Panel title="시스템 상태" className="col-4"
+      right={<span className={`state-pill state-${s.state}`}>{s.state}</span>}>
+      <div className="muted" style={{ marginBottom: 8 }}>노드 연결</div>
+      <div className="btn-row" style={{ marginBottom: 12 }}>
+        <Pill ok={c.nodes.vision} label="vision" />
+        <Pill ok={c.nodes.motion} label="motion" />
+        <Pill ok={c.nodes.gripper} label="gripper" />
+        <Pill ok={c.nodes.integration} warn={!c.nodes.integration} label="integration" />
+      </div>
+      <KV k="로봇 (E0509)" v={<Pill ok={c.robot} label={c.robot ? '연결됨' : '끊김'} />} />
+      <KV k="그리퍼 (Modbus/TCP)" v={<Pill ok={c.gripper} label={c.gripper ? '연결됨' : '끊김'} />} />
+      <KV k="카메라 (RealSense)" v={<Pill ok={c.camera} label={c.camera ? '스트리밍' : '대기'} />} />
+    </Panel>
+  )
+}
+
+function RobotPanel({ s }: { s: Snapshot }) {
+  const r = s.robot
+  return (
+    <Panel title="실시간 로봇 상태" className="col-4"
+      right={<Pill ok={!r.moving} warn={r.moving} label={r.moving ? '이동 중' : '정지'} />}>
+      {r.joints_deg.map((d, i) => (
+        <div className="jointrow" key={i}>
+          <span className="name">J{i + 1}</span>
+          <div className="bar">
+            <span style={{
+              left: '50%',
+              width: `${Math.min(50, Math.abs(d) / JOINT_LIMIT_DEG * 100)}%`,
+              transform: d < 0 ? 'translateX(-100%)' : 'none',
+            }} />
+          </div>
+          <span className="val">{d.toFixed(1)}°</span>
+        </div>
+      ))}
+      <hr style={{ borderColor: 'var(--border)', margin: '12px 0' }} />
+      <div className="muted" style={{ marginBottom: 6 }}>TCP 위치 (base, mm/°)</div>
+      {r.tcp ? (
+        <div className="row3">
+          {['X', 'Y', 'Z', 'Rx', 'Ry', 'Rz'].map((ax, i) => (
+            <KV key={ax} k={ax} v={r.tcp![i]?.toFixed(1)} />
+          ))}
+        </div>
+      ) : (
+        <div className="muted">posx 서비스 대기 중…</div>
+      )}
+    </Panel>
+  )
+}
+
+function GripperPanel({ s }: { s: Snapshot }) {
+  const g = s.gripper
+  const cur = g.present_current ?? 0
+  return (
+    <Panel title="실시간 그리퍼 상태" className="col-4"
+      right={<Pill ok={!!g.grasp_detected} warn={!g.grasp_detected}
+        label={g.grasp_detected ? 'GRASP 감지' : '미감지'} />}>
+      <Gauge label="위치" value={g.present_position ?? 0} max={1150} unit="" color="var(--accent)" />
+      <Gauge label="전류" value={cur} max={Math.max(g.current_limit ?? 820, cur, 100)}
+        unit="mA" color="var(--grasp)" />
+      <div className="row2" style={{ marginTop: 10 }}>
+        <KV k="현재 전류" v={`${cur} mA`} />
+        <KV k="목표/제한" v={`${g.current_limit ?? '-'} mA`} />
+        <KV k="목표 위치" v={g.goal_position ?? '-'} />
+        <KV k="온도" v={`${g.present_temperature ?? '-'}°`} />
+        <KV k="토크" v={g.torque_enabled ? 'ON' : 'OFF'} />
+        <KV k="object_lost" v={g.object_lost ? 'YES' : 'no'} />
+      </div>
+      {g.status_text && <div className="tag" style={{ marginTop: 8, display: 'block' }}>{g.status_text}</div>}
+    </Panel>
+  )
+}
+
+function VisionPanel({ s }: { s: Snapshot }) {
+  const v = s.vision
+  const slots = v.shelf_slots.length ? v.shelf_slots : Array(6).fill('unknown')
+  const p = v.pick_pose?.position
+  return (
+    <Panel title="비전 상태" className="col-4"
+      right={v.grasp_class ? <span className="tag">{v.grasp_class}</span> : <span className="muted">미감지</span>}>
+      <div className="muted" style={{ marginBottom: 6 }}>매대 슬롯 점유 (0~5)</div>
+      <div className="slots">
+        {slots.slice(0, 6).map((st, i) => (
+          <div key={i} className={`slot ${st === 'occupied' ? 'occupied' : st === 'empty' ? 'empty' : ''}`}>
+            <span className="idx">SLOT {i}</span>
+            <span>{st === 'unknown' ? '—' : st === 'occupied' ? '점유' : '비움'}</span>
+          </div>
+        ))}
+      </div>
+      <hr style={{ borderColor: 'var(--border)', margin: '12px 0' }} />
+      <div className="muted" style={{ marginBottom: 6 }}>감지 3D 위치 (pick)</div>
+      {p ? (
+        <div className="row3">
+          <KV k="x" v={p.x.toFixed(3)} />
+          <KV k="y" v={p.y.toFixed(3)} />
+          <KV k="z" v={p.z.toFixed(3)} />
+        </div>
+      ) : <div className="muted">pick_pose 없음</div>}
+      <KV k="후보 수" v={v.grasp_candidates.length} />
+      {v.obstacles && <KV k="장애물" v={<span className="tag">{v.obstacles}</span>} />}
+    </Panel>
+  )
+}
+
+function MetricsPanel({ m }: { m: import('./types').Metrics }) {
+  const pct = (v: number | null) => (v == null ? '—' : `${v}%`)
+  const tone = (v: number | null) => (v == null ? undefined : v >= 80 ? 'ok' : v >= 50 ? 'warn' : 'err')
+  return (
+    <Panel title="작업 성능 지표" className="col-8"
+      right={<button className="ghost" onClick={() => { if (confirm('지표 초기화?')) api.resetMetrics() }}>초기화</button>}>
+      <div className="stat-grid">
+        <Stat label="총 시도" value={m.attempts} />
+        <Stat label="파지 성공률 (전류)" value={pct(m.grasp_success_rate_current)} tone={tone(m.grasp_success_rate_current)} />
+        <Stat label="파지 성공률 (자세)" value={pct(m.grasp_success_rate_pose)} tone={tone(m.grasp_success_rate_pose)} />
+        <Stat label="Place 성공률" value={pct(m.place_success_rate)} tone={tone(m.place_success_rate)} />
+        <Stat label="평균 택타임" value={m.avg_tact_time == null ? '—' : `${m.avg_tact_time}s`} />
+        <Stat label="ERROR 발생" value={m.error_count} tone={m.error_count > 0 ? 'err' : 'ok'} />
+      </div>
+      <div className="btn-row" style={{ marginTop: 12 }}>
+        <button onClick={() => api.cycleStart()}>사이클 시작</button>
+        <button onClick={() => api.cycleEnd(true)}>사이클 종료</button>
+        <button onClick={() => api.markPlace(true)}>Place 성공 기록</button>
+        <button onClick={() => api.markPlace(false)}>Place 실패 기록</button>
+      </div>
+    </Panel>
+  )
+}
+
+export default function App() {
+  const { data, connected } = useTelemetry()
+
+  return (
+    <>
+      <div className="topbar">
+        <h1>🤖 Smart Shelf Robot — Operations Dashboard</h1>
+        <span className="spacer" />
+        {data && <span className={`state-pill state-${data.snapshot.state}`}>{data.snapshot.state}</span>}
+        <Pill ok={connected} label={connected ? 'WS 연결됨' : 'WS 끊김'} />
+        <button className="estop" onClick={() => api.estop(0)}>⏹ E-STOP</button>
+      </div>
+
+      {!data ? (
+        <div style={{ padding: 40, textAlign: 'center', color: 'var(--muted)' }}>
+          백엔드(dashboard_node)에 연결 중…
+        </div>
+      ) : (
+        <div className="grid">
+          <ConnectionPanel s={data.snapshot} />
+          <RobotPanel s={data.snapshot} />
+          <GripperPanel s={data.snapshot} />
+
+          <Panel title="카메라 라이브 피드" className="col-5">
+            <CameraFeed available={data.camera_available} />
+          </Panel>
+          <VisionPanel s={data.snapshot} />
+          <Panel title="그리퍼 전류 (최근 10s)" className="col-3">
+            <CurrentChart data={data.current_series} />
+          </Panel>
+
+          <MetricsPanel m={data.metrics} />
+          <ControlPanel gripper={data.snapshot.gripper} />
+          <OperatorPanel state={data.snapshot.state} />
+
+          <LogsPanel />
+        </div>
+      )}
+    </>
+  )
+}

@@ -1,0 +1,12 @@
+# smart-shelf-robot 웹 대시보드 백엔드 의존성
+# 검증 환경: Python 3.10, ROS2 humble
+# ※ rclpy / sensor_msgs / geometry_msgs / std_msgs / std_srvs 는 ROS2 humble 설치 포함
+# ※ dsr_msgs2 / dsr_gripper_tcp_interfaces 는 colcon 빌드(~/doosan_ws)
+#
+# 설치:  pip install -r src/dashboard/requirements.txt
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+# opencv 는 vision 노드(webcam_seg_node.py)가 이미 사용 (카메라 JPEG 인코딩).
+# 대시보드 백엔드 자체는 영상 디코드 안 함(JPEG 그대로 MJPEG 중계) → opencv 불필요.

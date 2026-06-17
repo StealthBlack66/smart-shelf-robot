@@ -24,3 +24,25 @@ log/
 *.db3
 .vscode/
 *.swp
+*.bak_pre_refactor_*
+
+# === vision 모듈화 (로컬 전용 — GitHub 미반영) ===
+src/vision/__pycache__/
+src/vision/vision_utils.py
+src/vision/coords_mixin.py
+src/vision/models_mixin.py
+src/vision/drawing_mixin.py
+src/vision/run_vision.sh
+# 리팩터 백업 / 런타임 로그
+src/vision/*.bak_pre_refactor_*
+src/vision/vision.log
+
+# === 웹 대시보드 산출물 (소스만 올리고 의존/빌드물은 제외) ===
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+# 대시보드 런타임 산출물
+src/dashboard/__pycache__/
+src/dashboard/dashboard_metrics.db
+web/server.log
+
