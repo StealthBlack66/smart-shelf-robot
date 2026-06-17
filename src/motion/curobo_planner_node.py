@@ -768,13 +768,15 @@ class ArmControllerNode(Node):
             pt = Float64MultiArray()
             pt.data = row.tolist()
             req.pos.append(pt)
-        req.vel = [float(os.environ.get('CUROBO_SPLINE_VEL', '70')) * self.VEL_SCALE] * 6
+        # 스플라인 관절 속도(deg/s). 머지로 vel_deg 정의가 누락됐던 것 복구.
+        vel_deg = float(os.environ.get('CUROBO_SPLINE_VEL', '70')) * self.VEL_SCALE * float(vel_scale)
+        req.vel = [vel_deg] * 6
         req.acc = [float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE] * 6
         req.time = 0.0; req.mode = 0; req.sync_type = 0
 
         # 궤적 총 이동량(최대 관절 arc)으로 실행 시간 추정 → 여유 2배 + 10s
         arc = float(np.abs(np.diff(traj_deg, axis=0)).sum(axis=1).max()) if n > 1 else 0.0
-        spline_timeout = max(60.0, arc / max(vel_deg, 1.0) * 2.0 + 10.0)
+        spline_timeout = max(45.0, arc / max(vel_deg, 1.0) * 2.0 + 10.0)
 
         self.get_logger().info(
             f"Spline 실행 ({n}pts) "
@@ -782,16 +784,14 @@ class ArmControllerNode(Node):
             f"end={[f'{v:.1f}' for v in traj_deg[-1]]} "
             f"vel={vel_deg:.1f}°/s timeout={spline_timeout:.0f}s")
         future = self.cli_spline.call_async(req)
-        # 이 로봇은 MoveSplineJoint 응답 future 가 안 오는 경우가 많음(모션은 실행됨).
-        # 그래서 future OR 실제 관절도달(joint_states) 둘 중 하나로 성공 판정.
+        # ★MoveSplineJoint(async, sync_type=0)는 명령 '접수' 즉시 success=True 반환 →
+        #   future 성공 = '모션 끝남' 이 아님(접수됨일 뿐). 그래서 future 로 도달판정하면
+        #   안 됨 → 실제 관절도달(joint_states < 3.5°)로만 판정.
         target = np.asarray(traj_rad[-1], dtype=float)
         t0 = time.time()
         reached = False
         last_log = 0.0
-        while time.time() - t0 < 45.0:
-            if future.done() and future.result() and future.result().success:
-                reached = True
-                break
+        while time.time() - t0 < spline_timeout:
             cj = self.current_joints
             if cj is not None:
                 err = float(np.max(np.abs(np.asarray(cj, dtype=float) - target)))
