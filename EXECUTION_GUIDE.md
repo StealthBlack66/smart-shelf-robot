@@ -207,3 +207,64 @@ ros2 launch smart-shelf-robot bringup.launch.py
    ```bash
    ros2 service call /dsr01/motion/move_joint dsr_msgs2/srv/MoveJoint "{pos: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], vel: 30.0, acc: 30.0}"
    ```
+
+---
+
+## 9. RealSense D455F 뎁스 카메라 설정 및 비전 처리 최적화 (Advanced Vision Guide)
+
+물체가 겹쳐 있고 난반사가 심한 편의점 매대 정리 환경에서 RealSense D455F(IR Pass-through 필터 적용 모델)를 사용하기 위해 드라이버 설정과 비전 처리 파이프라인의 핵심 정합성을 점검해야 합니다.
+
+### ① RealSense SDK 및 ROS2 Wrapper 핵심 실행 인자
+물리 카메라 노드를 기동할 때 반드시 **뎁스 이미지-컬러 이미지 픽셀 정합(Depth Alignment)**과 **적외선 프로젝터(Laser Emitter)**를 활성화해야 합니다.
+
+```bash
+# 뎁스-컬러 정합 및 프로젝터를 활성화하여 realsense2_camera 구동
+ros2 launch realsense2_camera rs_launch.py \
+    align_depth.enable:=true \
+    depth_module.emitter_enabled:=1 \
+    depth_module.profile:=640x480x30 \
+    rgb_camera.profile:=640x480x30
+```
+* **`align_depth.enable:=true` (필수)**: 이 옵션을 활성화해야 컬러 렌즈 프레임 기준의 정합된 뎁스 맵 토픽(`/camera/aligned_depth_to_color/image_raw`)이 발행됩니다.
+* **`depth_module.emitter_enabled:=1`**: 텍스처가 부족한 매대 선반이나 단색 포장지 표면에 인공 적외선 도트 패턴을 투사하여 뎁스 홀(Depth Hole, 노이즈) 발생을 억제합니다.
+
+### ② 비전 노드 토픽 정합성 수정 (Sim-to-Real 크리티컬 버그 예방)
+YOLO-seg 기반의 바운딩 박스와 세그멘테이션 마스크는 컬러 이미지(`/camera/color/image_raw`)를 기준으로 생성됩니다. 만약 정합되지 않은 생 뎁스 이미지(`/camera/depth/image_rect_raw`)에서 깊이 값을 샘플링할 경우, 두 렌즈 간의 물리적 오프셋(Baseline) 때문에 완전히 다른 3D 좌표를 얻게 됩니다.
+
+따라서 3D 좌표 추정 및 포인트클라우드 빌드 노드들이 구독하는 뎁스 토픽을 다음과 같이 변경해야 합니다.
+
+* **수정 대상 파일**: 
+  1. `src/custom/vision/pose_estimation_node.py`
+  2. `src/custom/vision/pointcloud_node.py`
+* **수정 내역 (구독 토픽 변경)**:
+  ```python
+  # 기존 코드
+  self.sub_depth = self.create_subscription(
+      Image, '/camera/depth/image_rect_raw', self.depth_callback, 10)
+      
+  # 변경 코드 (aligned depth 토픽 적용)
+  self.sub_depth = self.create_subscription(
+      Image, '/camera/aligned_depth_to_color/image_raw', self.depth_callback, 10)
+  ```
+
+### ③ 카메라 내부 파라미터(Camera Intrinsics) 동적 획득
+`pointcloud_node.py`에 하드코딩된 내부 파라미터(`CAMERA_FX = 615.0` 등)는 캘리브레이션 오차의 원인이 됩니다. `pose_estimation_node.py`와 같이 다음과 같이 `/camera/depth/camera_info` 토픽을 구독하여 카메라 해상도 및 초점 거리를 실시간으로 매핑하도록 기능을 수정 및 보완하는 것이 권장됩니다.
+```python
+# camera_info 구독 추가 예시
+self.sub_cam_info = self.create_subscription(
+    CameraInfo, '/camera/depth/camera_info', self.camera_info_callback, 10)
+
+def camera_info_callback(self, msg):
+    self.fx, self.fy = msg.k[0], msg.k[4]
+    self.cx, self.cy = msg.k[2], msg.k[5]
+```
+
+### ④ 조명 및 환경 변화에 따른 RealSense 튜닝 팁
+실시간 환경에서 편의점 매대의 밝기나 재질에 따라 노이즈가 심할 경우, 아래 동적 파라미터 재설정을 통해 뎁스 데이터 품질을 최적화할 수 있습니다.
+```bash
+# 레이저 프로젝터 강도 최대화 (기본값: 150)
+ros2 param set /camera/camera depth_module.laser_power 360
+
+# 자동 노출 활성화
+ros2 param set /camera/camera depth_module.enable_auto_exposure true
+```
