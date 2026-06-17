@@ -53,46 +53,7 @@ from dsr_gripper_tcp_interfaces.action import SafeGrasp
 class ArmControllerNode(Node):
     JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
-    # Named joint targets (degrees)
-    HOME_JOINTS_DEG         = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
-    SHELF_VIEW_JOINTS_DEG   = [-6.73, 8.12, 104.62, 80.22, 93.13, -23.49]
-    PRODUCT_VIEW_JOINTS_DEG = [0.0, -36.0, 56.0, 5.0, 110.0, 0.0]
-
-    NAMED_TARGETS_DEG = {
-        'home':         HOME_JOINTS_DEG,
-        'shelf_view':   SHELF_VIEW_JOINTS_DEG,
-        'product_view': PRODUCT_VIEW_JOINTS_DEG,
-    }
-
-    # Place 시퀀스 좌표 (posx = [x,y,z mm, a,b,c ZYZ deg])
-    SLOT0_POINT_J_DEG  = [27.67, 5.82, 95.72, 90.93, 61.98, -10.64]
-    SLOT0_L_POSX       = [357.21, 511.97, 487.17, 89.98, 94.59, 90.0]
-    SLOT0_DOWN_L_POSX  = [357.230, 498.590, 468.640, 89.98, 94.59, 90.0]
-
-    SLOT1_POINT_J_DEG  = [21.17, 23.36, 72.79, 87.48, 68.49, -4.8]
-    SLOT1_L_POSX       = [483.77, 449.08, 493.21, 89.99, 94.59, 90.01]
-
-    SLOT2_POINT_J_DEG  = [22.17, 23.13, 103.31, 99.79, 69.5, -37.32]
-    SLOT2_L_POSX       = [413.61, 511.97, 310.56, 90.00, 90.58, 90.0]
-    SLOT2_DOWN_L_POSX  = [413.61, 511.97, 290.15, 103.00, 90.58, 90.0]
-
-    PLACE_TARGETS = {
-        'bottle': {
-            'point_j':         SLOT0_POINT_J_DEG,
-            'entry_posx':      SLOT0_L_POSX,
-            'grasp_down_posx': SLOT0_DOWN_L_POSX,
-        },
-        'snack_bag': {
-            'point_j':         SLOT1_POINT_J_DEG,
-            'entry_posx':      SLOT1_L_POSX,
-            'grasp_down_posx': None,
-        },
-        'can': {
-            'point_j':         SLOT2_POINT_J_DEG,
-            'entry_posx':      SLOT2_L_POSX,
-            'grasp_down_posx': SLOT2_DOWN_L_POSX,
-        },
-    }
+    # Named targets / place targets — config/place_targets.yaml 에서 로드 (_load_place_targets)
 
     # 안전/속도 상수
     TCP_Z_MIN  = 0.02   # m, base 기준 TCP 최저 허용 Z (바닥 충돌 방지)
@@ -105,15 +66,15 @@ class ArmControllerNode(Node):
 
         self.declare_parameter('place_target', 'can')
         self.declare_parameter('grasp_target_position', 700)
-        self.declare_parameter('grasp_max_current',     600)
-        self.declare_parameter('grasp_current_delta',   30)
+        self.declare_parameter('grasp_max_current',     400)
+        self.declare_parameter('grasp_current_delta',   300)
         self.declare_parameter('grasp_open_position',   0)
 
         self.service_cb_group = rclpy.callback_groups.ReentrantCallbackGroup()
 
         # 상태
         self.current_joints = None
-        self.object_pose    = None
+
         self.grasp_class    = None
         # [goalset 실험] webcam_seg가 보낸 GraspGen 후보 EE pose 묶음 + 수신시각
         self.grasp_candidates = []   # [(pos[3], quat_xyzw[4]), ...]
@@ -178,12 +139,11 @@ class ArmControllerNode(Node):
         self.get_logger().info("cuRobo 준비 완료!")
 
         self.grasp_force_params = self._load_grasp_force_params(config_dir)
+        self._load_place_targets(config_dir)
 
         # Subscribers
         self.create_subscription(JointState, '/dsr01/joint_states',
                                  self._joint_state_cb, 10)
-        self.create_subscription(PoseStamped, '/object_pose',
-                                 self._object_pose_cb, 10)
         # Pipeline B 토픽
         # pick/target 콜백은 내부에서 서비스(spline/movel/posx)를 동기 대기하므로
         # reentrant 그룹에 둬야 콜백 실행 중에도 서비스 응답 future 가 처리됨
@@ -206,7 +166,6 @@ class ArmControllerNode(Node):
         for name, cb in [
             ('/move_to_shelf_view',   self._srv_shelf_view),
             ('/move_to_product_view', self._srv_product_view),
-            ('/move_to_pick',         self._srv_pick),
             ('/move_to_place',        self._srv_place),
             ('/move_to_home',         self._srv_home),
         ]:
@@ -249,6 +208,18 @@ class ArmControllerNode(Node):
             get_package_share_directory("e0509_gripper_description"),
             "config", "curobo")
 
+    def _load_place_targets(self, config_dir):
+        path = os.path.join(os.path.dirname(config_dir), "place_targets.yaml")
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        self.NAMED_TARGETS_DEG = {k: list(v) for k, v in data.get('named_targets', {}).items()}
+        self.PLACE_TARGETS     = {k: {ik: (list(iv) if iv is not None else None)
+                                       for ik, iv in v.items()}
+                                   for k, v in data.get('place_targets', {}).items()}
+        self.get_logger().info(
+            f"place_targets 로드: named={list(self.NAMED_TARGETS_DEG)}, "
+            f"place={list(self.PLACE_TARGETS)}")
+
     def _load_grasp_force_params(self, config_dir):
         path = os.path.join(os.path.dirname(config_dir), "grasp_force_params.yaml")
         try:
@@ -270,12 +241,15 @@ class ArmControllerNode(Node):
         if None not in joints:
             self.current_joints = joints
 
-    def _object_pose_cb(self, msg: PoseStamped):
-        self.object_pose = msg
-
     def _grasp_class_cb(self, msg: String):
         self.grasp_class = msg.data.strip() or None
-        self.get_logger().info(f"[grasp_class] {self.grasp_class}")
+        if self.grasp_class and self.grasp_class in self.PLACE_TARGETS:
+            self.get_logger().info(
+                f"[grasp_class] {self.grasp_class} → place 준비됨")
+        else:
+            self.get_logger().warn(
+                f"[grasp_class] '{self.grasp_class}' — PLACE_TARGETS에 없음 "
+                f"(가능: {list(self.PLACE_TARGETS.keys())})")
 
     def _grasp_candidates_cb(self, msg: PoseArray):
         """[goalset 실험] webcam_seg가 보낸 GraspGen 후보 EE pose 묶음 저장."""
@@ -299,8 +273,8 @@ class ArmControllerNode(Node):
                     pose=[obj["pos"][0], obj["pos"][1], obj["pos"][2], 1, 0, 0, 0],
                     dims=obj.get("dims", [0.05, 0.05, 0.05])))
             self.motion_gen.update_world(WorldConfig(cuboid=cuboids))
-            self.get_logger().info(
-                f"장애물 업데이트: table + {len(data)}개")
+            #self.get_logger().info(
+                #f"장애물 업데이트: table + {len(data)}개")
         except Exception as e:
             self.get_logger().error(f"장애물 업데이트 실패: {e}")
 
@@ -350,25 +324,13 @@ class ArmControllerNode(Node):
         response.message = "완료" if ok else "실패"
         return response
 
-    def _srv_pick(self, request, response):
-        if self.object_pose is None:
-            response.success = False
-            response.message = "/object_pose 미수신"
-            return response
-        if self.current_joints is None:
-            response.success = False
-            response.message = "joint_states 미수신"
-            return response
-        self._do_pick_sequence(self.object_pose)
-        response.success = True
-        response.message = "Pick 완료"
-        return response
-
     def _srv_place(self, request, response):
+        used_target = (self.grasp_class
+                       if self.grasp_class and self.grasp_class in self.PLACE_TARGETS
+                       else self.get_parameter('place_target').get_parameter_value().string_value)
         ok = self._move_to_place()
-        place_target = self.get_parameter('place_target').get_parameter_value().string_value
         response.success = ok
-        response.message = f"Place {'완료' if ok else '실패'} ({place_target})"
+        response.message = f"Place {'완료' if ok else '실패'} ({used_target})"
         return response
 
     def _srv_home(self, request, response):
@@ -411,6 +373,8 @@ class ArmControllerNode(Node):
         if not self.execute_spline(traj):
             self.get_logger().error("Pick 실패: 프리그래스프 실행 실패")
             return
+        spline_vel_scale = 1.5 if self.grasp_class == 'snack_bag' else 1.0
+        self.execute_spline(traj, vel_scale=spline_vel_scale)
         time.sleep(2.0)
         # 프리그래스프에서 실제 풀린 자세(원본/180°플립) — 전진도 같은 자세로 (손목 연속)
         q = getattr(self, '_last_plan_quat_wxyz', quat_wxyz)  # [w,x,y,z]
@@ -544,7 +508,12 @@ class ArmControllerNode(Node):
     def _move_to_place(self) -> bool:
         """접근 joint → 진입 pose → 수직 하강(선택) → 그리퍼 열기 → 복귀
         cuRobo 검증 없이 직접 실행 (place 좌표는 사전 검증된 하드코딩값)."""
-        place_target = self.get_parameter('place_target').get_parameter_value().string_value
+        # self.grasp_class 우선 사용 (grasp_class 토픽에서 직접 갱신됨)
+        # 없으면 파라미터 fallback
+        param_target = self.get_parameter('place_target').get_parameter_value().string_value
+        place_target = (self.grasp_class
+                        if self.grasp_class and self.grasp_class in self.PLACE_TARGETS
+                        else param_target)
         if place_target not in self.PLACE_TARGETS:
             self.get_logger().error(
                 f"알 수 없는 place_target: '{place_target}' "
@@ -552,7 +521,7 @@ class ArmControllerNode(Node):
             return False
         target = self.PLACE_TARGETS[place_target]
         self.get_logger().info(f"_move_to_place: '{place_target}'")
-        time.sleep(10.0)
+        # time.sleep(10.0)
 
         if not self._execute_movej(target['point_j']):
             return False
@@ -781,7 +750,7 @@ class ArmControllerNode(Node):
 
     # ── Doosan 실행 ───────────────────────────────────────────
 
-    def execute_spline(self, traj_rad):
+    def execute_spline(self, traj_rad, vel_scale: float = 1.0):
         if not self.cli_spline.wait_for_service(timeout_sec=3.0):
             self.get_logger().error("MoveSplineJoint 서비스 없음")
             return
@@ -803,10 +772,15 @@ class ArmControllerNode(Node):
         req.acc = [float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE] * 6
         req.time = 0.0; req.mode = 0; req.sync_type = 0
 
+        # 궤적 총 이동량(최대 관절 arc)으로 실행 시간 추정 → 여유 2배 + 10s
+        arc = float(np.abs(np.diff(traj_deg, axis=0)).sum(axis=1).max()) if n > 1 else 0.0
+        spline_timeout = max(60.0, arc / max(vel_deg, 1.0) * 2.0 + 10.0)
+
         self.get_logger().info(
             f"Spline 실행 ({n}pts) "
             f"start={[f'{v:.1f}' for v in traj_deg[0]]} "
-            f"end={[f'{v:.1f}' for v in traj_deg[-1]]}")
+            f"end={[f'{v:.1f}' for v in traj_deg[-1]]} "
+            f"vel={vel_deg:.1f}°/s timeout={spline_timeout:.0f}s")
         future = self.cli_spline.call_async(req)
         # 이 로봇은 MoveSplineJoint 응답 future 가 안 오는 경우가 많음(모션은 실행됨).
         # 그래서 future OR 실제 관절도달(joint_states) 둘 중 하나로 성공 판정.
