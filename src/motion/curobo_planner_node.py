@@ -84,7 +84,7 @@ class ArmControllerNode(Node):
         self.gripper_coll_links = [
             'gripper_rh_p12_rn_base', 'gripper_rh_p12_rn_r1', 'gripper_rh_p12_rn_l1',
             'gripper_rh_p12_rn_r2', 'gripper_rh_p12_rn_l2', 'attached_object']
-        self.PREGRASP_STANDOFF = float(os.environ.get('CUROBO_PREGRASP_STANDOFF', '0.12'))
+        self.PREGRASP_STANDOFF = float(os.environ.get('CUROBO_PREGRASP_STANDOFF', '0.06'))
 
         # cuRobo 초기화 (GPU 1회만)
         self.get_logger().info("cuRobo 초기화 중...")
@@ -97,7 +97,14 @@ class ArmControllerNode(Node):
         #   base_link 안 빼면 정상자세에서도 base 구체가 팔과 헛충돌 → 모든 plan 실패(실증).
         _cfg = yaml.safe_load(open(os.path.join(config_dir, "e0509_gripper.yml"), encoding='utf-8'))
         _kin = _cfg["robot_cfg"]["kinematics"]
-        _kin["urdf_path"] = os.path.join(config_dir, _kin["urdf_path"])
+        # ★관절한계 URDF (시뮬팀 리스크① — 손목 플립 방지). joint_4 ±180° / joint_5 0~135°.
+        #   cuRobo BoundCost는 URDF를 init에서 clone → 런타임 텐서 수정 무효, 반드시 URDF로 박아야 함.
+        #   안 박으면 후보가 멀쩡해도 실기 팔이 플립(joint_5 음수=손목 뒤집힘).
+        _src_urdf = os.path.join(config_dir, _kin["urdf_path"])
+        _kin["urdf_path"] = self._make_jlim_urdf(
+            _src_urdf, "/tmp/e0509_gripper_jlim.urdf",
+            {"joint_4": (-3.141592653589793, 3.141592653589793),   # ±180°
+             "joint_5": (0.0, 2.356194490192345)})                 # 0~135°
         _kin["asset_root_path"] = config_dir
         _sph = yaml.safe_load(open(os.path.join(config_dir, _kin["collision_spheres"]), encoding='utf-8'))
         _kin["collision_spheres"] = _sph["collision_spheres"]
@@ -148,9 +155,6 @@ class ArmControllerNode(Node):
         # pick/target 콜백은 내부에서 서비스(spline/movel/posx)를 동기 대기하므로
         # reentrant 그룹에 둬야 콜백 실행 중에도 서비스 응답 future 가 처리됨
         # (기본 그룹이면 spline/posx future 가 30s/3s 타임아웃 → false 실패).
-        self.create_subscription(PoseStamped, '/dsr01/curobo/target_pose',
-                                 self._target_pose_cb, 10,
-                                 callback_group=self.service_cb_group)
         self.create_subscription(PoseStamped, '/dsr01/curobo/pick_pose',
                                  self._pick_pose_cb, 10,
                                  callback_group=self.service_cb_group)
@@ -194,6 +198,24 @@ class ArmControllerNode(Node):
         self.get_logger().info("========================================")
 
     # ── 초기화 헬퍼 ───────────────────────────────────────────
+
+    def _make_jlim_urdf(self, src_urdf, dst_urdf, overrides):
+        """원본 URDF를 안 건드리고 지정 관절 position 한계만 바꾼 복사본 생성 (시뮬팀 stage7 동일).
+        cuRobo BoundCost는 URDF를 init에서 clone → 런타임 텐서 수정 무효, 반드시 URDF로 줘야 반영됨.
+        overrides={joint:(lower,upper)}. 손목 플립 방지(joint_5 음수 금지)용."""
+        import xml.etree.ElementTree as ET
+        tree = ET.parse(src_urdf); root = tree.getroot(); hit = []
+        for j in root.findall("joint"):
+            if j.get("name") in overrides:
+                lim = j.find("limit")
+                if lim is None:
+                    continue
+                lo, up = overrides[j.get("name")]
+                lim.set("lower", repr(float(lo))); lim.set("upper", repr(float(up)))
+                hit.append(j.get("name"))
+        tree.write(dst_urdf, encoding="utf-8", xml_declaration=True)
+        self.get_logger().info(f"[관절한계URDF] {dst_urdf} — 수정 관절 {hit} (손목플립 방지)")
+        return dst_urdf
 
     def _find_config_dir(self):
         # __file__ = src/motion/curobo_planner_node.py → 3단계 위가 패키지 루트
@@ -279,23 +301,6 @@ class ArmControllerNode(Node):
             self.get_logger().error(f"장애물 업데이트 실패: {e}")
 
     # Pipeline B 토픽 콜백
-    def _target_pose_cb(self, msg: PoseStamped):
-        if self.current_joints is None:
-            self.get_logger().warn("joint_states 미수신")
-            return
-        pos, ori = msg.pose.position, msg.pose.orientation
-        safe_z = pos.z
-        if safe_z < self.TCP_Z_MIN:
-            self.get_logger().warn(
-                f"[FLOOR GUARD] z={pos.z*1000:.1f}mm → {self.TCP_Z_MIN*1000:.0f}mm 클램프")
-            safe_z = self.TCP_Z_MIN
-        traj = self.plan(self.current_joints, [pos.x, pos.y, safe_z],
-                         [ori.w, ori.x, ori.y, ori.z])
-        if traj is not None:
-            self.execute_spline(traj)
-        else:
-            self.get_logger().error("경로계획 실패")
-
     def _pick_pose_cb(self, msg: PoseStamped):
         if self.current_joints is None:
             self.get_logger().warn("joint_states 미수신")
@@ -347,7 +352,7 @@ class ArmControllerNode(Node):
         pos, ori = pose.pose.position, pose.pose.orientation
         quat_wxyz = [ori.w, ori.x, ori.y, ori.z]
         LIFT_HEIGHT = 0.15  # m
-        STANDOFF = float(os.environ.get('CUROBO_PICK_STANDOFF', '0.12'))  # m, 축방향 후퇴거리
+        STANDOFF = float(os.environ.get('CUROBO_PICK_STANDOFF', '0.06'))  # m, 축방향 후퇴거리 (s와 통일)
 
         grasp = np.array([pos.x, pos.y, pos.z], dtype=float)
         if grasp[2] < self.TCP_Z_MIN:
@@ -751,63 +756,42 @@ class ArmControllerNode(Node):
     # ── Doosan 실행 ───────────────────────────────────────────
 
     def execute_spline(self, traj_rad, vel_scale: float = 1.0):
-        if not self.cli_spline.wait_for_service(timeout_sec=3.0):
-            self.get_logger().error("MoveSplineJoint 서비스 없음")
-            return
+        """[단발 movej] cuRobo 궤적 끝점까지 movej 한 번으로 이동 = 홈 이동과 동일 방식
+        → 한 개의 매끄러운 사다리꼴 속도프로파일이라 끊김 없음. (movesj=hang, 다점
+        movej=서로 덮어써 끊김 → 단발 movej 가 가장 부드럽고 확실. 2026-06-17)"""
+        if not self.cli_movej.wait_for_service(timeout_sec=3.0):
+            self.get_logger().error("MoveJoint 서비스 없음")
+            return False
         traj_deg = np.rad2deg(traj_rad)
-        n = traj_deg.shape[0]
-        # dense 한 cuRobo interpolated plan(수십~수백 pt)을 듬성하게 → 스플라인이 빠르게 통과.
-        _maxpt = int(os.environ.get('CUROBO_SPLINE_MAXPT', '25'))
-        if n > _maxpt:
-            traj_deg = traj_deg[np.linspace(0, n - 1, _maxpt, dtype=int)]
-            n = _maxpt
-
-        req = MoveSplineJoint.Request()
-        req.pos_cnt = n
-        for row in traj_deg:
-            pt = Float64MultiArray()
-            pt.data = row.tolist()
-            req.pos.append(pt)
-        # 스플라인 관절 속도(deg/s). 머지로 vel_deg 정의가 누락됐던 것 복구.
+        target_deg = [float(v) for v in traj_deg[-1]]
+        target_rad = np.asarray(traj_rad[-1], dtype=float)
         vel_deg = float(os.environ.get('CUROBO_SPLINE_VEL', '70')) * self.VEL_SCALE * float(vel_scale)
-        req.vel = [vel_deg] * 6
-        req.acc = [float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE] * 6
-        req.time = 0.0; req.mode = 0; req.sync_type = 0
-
-        # 궤적 총 이동량(최대 관절 arc)으로 실행 시간 추정 → 여유 2배 + 10s
-        arc = float(np.abs(np.diff(traj_deg, axis=0)).sum(axis=1).max()) if n > 1 else 0.0
-        spline_timeout = max(45.0, arc / max(vel_deg, 1.0) * 2.0 + 10.0)
-
+        acc_deg = float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE
+        req = MoveJoint.Request()
+        req.pos = target_deg; req.vel = vel_deg; req.acc = acc_deg
+        req.time = 0.0; req.radius = 0.0; req.mode = 0
+        req.blend_type = 0; req.sync_type = 0
         self.get_logger().info(
-            f"Spline 실행 ({n}pts) "
-            f"start={[f'{v:.1f}' for v in traj_deg[0]]} "
-            f"end={[f'{v:.1f}' for v in traj_deg[-1]]} "
-            f"vel={vel_deg:.1f}°/s timeout={spline_timeout:.0f}s")
-        future = self.cli_spline.call_async(req)
-        # ★MoveSplineJoint(async, sync_type=0)는 명령 '접수' 즉시 success=True 반환 →
-        #   future 성공 = '모션 끝남' 이 아님(접수됨일 뿐). 그래서 future 로 도달판정하면
-        #   안 됨 → 실제 관절도달(joint_states < 3.5°)로만 판정.
-        target = np.asarray(traj_rad[-1], dtype=float)
-        t0 = time.time()
-        reached = False
-        last_log = 0.0
-        while time.time() - t0 < spline_timeout:
+            f"모션(단발 movej) → end={[f'{v:.1f}' for v in target_deg]} vel={vel_deg:.0f}°/s")
+        self.cli_movej.call_async(req)
+        # 실제 관절 도달 대기 (movej sync_type=0 은 접수 즉시 반환 → joint_states 로 판정)
+        t0 = time.time(); reached = False; last_log = 0.0
+        while time.time() - t0 < 40.0:
             cj = self.current_joints
             if cj is not None:
-                err = float(np.max(np.abs(np.asarray(cj, dtype=float) - target)))
+                err = float(np.max(np.abs(np.asarray(cj, dtype=float) - target_rad)))
                 if err < np.radians(3.5):
-                    reached = True
-                    break
-                # 5초마다 진행상황 (멈췄나 진행중인가 판별용)
+                    reached = True; break
                 if time.time() - t0 - last_log > 5.0:
                     last_log = time.time() - t0
                     self.get_logger().info(
-                        f"  스플라인 진행중... 도달오차 {np.degrees(err):.1f}° ({last_log:.0f}s)")
+                        f"  모션 진행중... 도달오차 {np.degrees(err):.1f}° ({last_log:.0f}s)")
             time.sleep(0.1)
+        cj = self.current_joints
         self.get_logger().info(
-            "Spline " + ("완료" if reached else "실패(미도달)") +
-            (f" (도달오차 {np.degrees(np.max(np.abs(np.asarray(self.current_joints, dtype=float)-target))):.1f}°)"
-             if self.current_joints is not None else ""))
+            "모션 " + ("완료" if reached else "실패(미도달)") +
+            (f" (도달오차 {np.degrees(float(np.max(np.abs(np.asarray(cj,dtype=float)-target_rad)))):.1f}°)"
+             if cj is not None else ""))
         return reached
 
     def _execute_movej(self, joints_deg, vel: float = 30.0, acc: float = 30.0) -> bool:
