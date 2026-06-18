@@ -619,7 +619,7 @@ class WebcamSegNode(Node):
                                os.path.expanduser('~/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py'))
         self.declare_parameter('gd_weights',
                                os.path.expanduser('~/models/groundingdino_swint_ogc.pth'))
-        self.declare_parameter('gd_prompts', 'can . bottle . snack bag . coffee')
+        self.declare_parameter('gd_prompts', 'can . bottle . snack bag')
         self.declare_parameter('gd_interval', 3.0)
         self.declare_parameter('gd_box_thr', 0.30)
         self.declare_parameter('gd_text_thr', 0.25)
@@ -1074,7 +1074,7 @@ class WebcamSegNode(Node):
             time.sleep(1)
 
     def _setup_window(self):
-        self.win = 'webcam_seg_node (1-9=lock g=graspgen p=pick v=shelf a=AUTO h=home r=cancel c=clear f=full m=refine ESC=quit)'
+        self.win = 'webcam_seg_node (1-9=lock g=graspgen p=pick v=shelf a=AUTO o=open h=home r=cancel c=clear f=full m=refine ESC=quit)'
         # WINDOW_NORMAL + resizeWindow 로 widget 1600x1200 시작 사이즈.
         # 영상은 640x480 그대로 imshow → cv2 가 widget 에 KEEPRATIO 로 스케일 (가벼움).
         # widget 비율 1600:1200 = 영상 640:480 = 4:3 → 패딩 X.
@@ -1632,6 +1632,18 @@ class WebcamSegNode(Node):
             return None
         return self.detections[0] if self.detections else None
 
+    @staticmethod
+    def _apply_grasp_yaw(R_grasp, approach):
+        """can/bottle 파지를 월드 Z축 기준 XY평면 안에서 yaw 회전 (수직 안 들고 수평 유지,
+        approach 방향만 꺾음). WSN_GRASP_YAW(deg, 기본 90). approach 도 회전 반영해 반환."""
+        _yaw = np.radians(float(os.environ.get('WSN_GRASP_YAW', '90')))
+        if abs(_yaw) < 1e-6:
+            return R_grasp, approach
+        _cz, _sz = np.cos(_yaw), np.sin(_yaw)
+        _Rz = np.array([[_cz, -_sz, 0.0], [_sz, _cz, 0.0], [0.0, 0.0, 1.0]])
+        R2 = _Rz @ np.asarray(R_grasp, dtype=float)
+        return R2, R2[:, 2].copy()
+
     def _level_grasp_orient(self, approach, R_grasp, ggl, Cxy):
         """can/bottle 옆면 수평 레벨링 → (quat[x,y,z,w], approach). 단일·goalset 후보 공용."""
         approach = np.asarray(approach, dtype=float)
@@ -1651,6 +1663,7 @@ class WebcamSegNode(Node):
             if os.environ.get('WSN_LEVEL_SWAP', '1') != '0':
                 x, y = y, -x
             R_grasp = np.column_stack([x, y, approach])
+            R_grasp, approach = self._apply_grasp_yaw(R_grasp, approach)  # XY평면 90° 꺾기
         return _rotm_to_quat(R_grasp), approach
 
     def _publish_grasp_candidates(self, grasps, confs, idx, center, C, det):
@@ -1888,6 +1901,10 @@ class WebcamSegNode(Node):
         y = np.cross(approach, x); y /= (np.linalg.norm(y) + 1e-9)
         R = np.column_stack([x, y, approach])
         quat = _rotm_to_quat(R)
+        # 스낵 X 오프셋 + 축방향(아래) 추가 하강 — C 에 적용 (standoff 가 C 기준).
+        C = np.asarray(C, dtype=float)
+        C[0] += float(os.environ.get('WSN_SNACK_X_OFFSET', '0.02'))
+        C = C + float(os.environ.get('WSN_SNACK_DOWN_EXTRA', '0.02')) * np.asarray(approach)
         self.pending_grasp_pose = (C, np.asarray(quat), np.asarray(approach))
         self.publish_grasp_marker(C, quat, action=Marker.ADD)
         # goalset 후보 비움 → 'p'가 standoff 단일경로(수직 하강)로 가게
@@ -1915,9 +1932,10 @@ class WebcamSegNode(Node):
         if cloud is None or len(cloud) < 50:
             self.get_logger().warn('포인트클라우드 부족'); return
         cloud = np.asarray(cloud, dtype=np.float32)
-        # ── 과자봉지: 수직(top-down) 파지. GraspGen/방위필터 우회하고 검출 중심에서 바로.
-        #   (캔/병은 옆면 수평. 과자는 누운 봉지라 위에서 수직 중심을 잡아야 잡힘.)
-        if det.get('gg_label') == 'snack_bag':
+        # ── 과자봉지: 무조건 수직(top-down) 파지. GraspGen/방위필터 우회.
+        #   gg_label 이 'snack_bag' 이거나 이름에 'snack' 포함이면 항상 수직 (수평 절대 X).
+        _nm0 = str(det.get('name', '')).lower()
+        if det.get('gg_label') == 'snack_bag' or 'snack' in _nm0:
             self._snack_topdown_grasp(det, cloud)
             return
         center = cloud.mean(axis=0)
@@ -1932,6 +1950,10 @@ class WebcamSegNode(Node):
         # ── 파지 선택. 캔/병(원통)은 옆면 수평 파지 — approach 가 XY평면에 평행
         # (base z 성분 az≈0)인 것 우선. 그 외(스낵 등)는 conf 최고.
         _ggl = det.get('gg_label')
+        _nm = str(det.get('name', '')).lower()
+        # 캔/병/커피(원통형) = 무조건 옆면 수평 파지. gg_label 누락 대비 이름으로도 매칭.
+        _is_cyl = (_ggl in ('can', 'pet_bottle')
+                   or 'can' in _nm or 'bottle' in _nm)
         az = grasps[:, 2, 2]   # 각 grasp approach(Z열)의 base z 성분 (0=수평, ±1=수직)
         # ── 접근 방위각 제한: 기준방향 ±range 안의 grasp만 (반대쪽/뒤 접근 제외).
         # 기준 기본 = radial(베이스→물체). WSN_GRASP_AZ_REF(deg)로 고정, RANGE(기본90).
@@ -1950,7 +1972,7 @@ class WebcamSegNode(Node):
             _dotr = (_axy[:, 0]*_ref[0] + _axy[:, 1]*_ref[1]) / _nn
             _azok = _dotr >= np.cos(np.radians(
                 float(os.environ.get('WSN_GRASP_AZ_RANGE', '90'))))
-        if _ggl in ('can', 'pet_bottle'):
+        if _is_cyl:
             # 방위 OK + 수평-ish(|az|<0.45) 중 선택. 없으면 단계적 완화.
             _ok = np.where((np.abs(az) < 0.45) & _azok)[0]
             if _ok.size == 0:
@@ -1980,7 +2002,7 @@ class WebcamSegNode(Node):
         #   approach 의 수직성분 제거 → 완전 수평 접근축. 핑거축도 수평(XY평면).
         #   binormal = 수직(world +Z). → 그리퍼 전체가 XY평면에 평평하게 누움.
         # (WSN_LEVEL_GRASP=0 으로 off, 핑거축 90° 어긋나면 WSN_LEVEL_SWAP=1)
-        if (_ggl in ('can', 'pet_bottle')
+        if (_is_cyl
                 and os.environ.get('WSN_LEVEL_GRASP', '1') != '0'):
             # 방위각: 캔/병은 원통이라 어느 방향서 잡아도 됨 → 베이스→물체 직선(radial)
             # 방향으로 고정. GraspGen 의 45° 대각 방위 제거 + 손목 회전(spin) 최소화.
@@ -2000,11 +2022,19 @@ class WebcamSegNode(Node):
                 if os.environ.get('WSN_LEVEL_SWAP', '1') != '0':   # 기본 swap ON
                     x, y = y, -x                                   # 핑거축 90° (RH-P12 보정)
                 R_grasp = np.column_stack([x, y, approach])
+                R_grasp, approach = self._apply_grasp_yaw(R_grasp, approach)  # XY평면 90° 꺾기
         quat = _rotm_to_quat(R_grasp)
         # 앵커 = 안정적인 캔 검출 중심 C (GraspGen pos 는 노이즈 심해 안 씀).
         C = np.asarray(det.get('center_base'), dtype=float)
         if self.grasp_fixed_z is not None:
             C[2] = self.grasp_fixed_z   # 잡는 높이 고정 (검출 z 무시)
+        # ★X축 오프셋을 파지중심 C 에 적용 → goalset 후보(candidates)·standoff 둘 다 반영.
+        #   (goalset 모드는 pick_pose 무시하고 candidates 씀 → advance_and_grip 에 넣으면 무시됨)
+        #   캔/바틀 기본 3.5cm, 바틀 +2cm. env: WSN_S_X_OFFSET / WSN_BOTTLE_X_EXTRA.
+        _xo = float(os.environ.get('WSN_S_X_OFFSET', '0.010'))
+        if _ggl == 'pet_bottle' or 'bottle' in str(det.get('name', '')).lower():
+            _xo += float(os.environ.get('WSN_BOTTLE_X_EXTRA', '0.0'))
+        C[0] += _xo
         # pending = (캔중심 C, quat, approach) — s/p 모두 C 기준으로 계산.
         self.pending_grasp_pose = (C, np.asarray(quat), np.asarray(approach))
         self.publish_grasp_marker(C, quat, action=Marker.ADD)
@@ -2203,14 +2233,13 @@ class WebcamSegNode(Node):
         time.sleep(0.3)
         # 집기: 그리퍼밑동 = 캔중심 - 그리퍼길이*approach (손가락이 캔중심에 닿음).
         adv = np.asarray(C, dtype=float) - self.gripper_offset * np.asarray(approach)
-        # base X축 추가 오프셋 — 캔/병만 +3cm (s와 동일). 과자는 적용 X.
-        _ggl = (_sel or {}).get('gg_label')
-        _sxo = 0.0 if _ggl == 'snack_bag' else float(os.environ.get('WSN_S_X_OFFSET', '0.03'))
-        adv[0] += _sxo
+        # X 오프셋·하강 오프셋은 이미 파지중심 C 에 반영됨(send_graspgen/_snack_topdown).
+        # → 여기선 그대로 C - 그리퍼길이·approach 만. (goalset candidates 와 일관)
         msg = self._pose_msg(adv, quat)
         self.pub_pick.publish(msg)
         self.get_logger().info(
-            f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach, +X{_sxo*100:.0f}cm) → /dsr01/curobo/pick_pose "
+            f"[p] 집기(캔중심-{self.gripper_offset*100:.0f}cm·approach, X오프셋은 C에 반영됨) "
+            f"→ /dsr01/curobo/pick_pose "
             f"({adv[0]*1000:.0f},{adv[1]*1000:.0f},{adv[2]*1000:.0f})mm (이후 15cm 수직 lift)")
         self.clear_grasp_preview()
         return True
@@ -3550,6 +3579,7 @@ class WebcamSegNode(Node):
                 vH, vW = vis.shape[:2]
                 isnet_boxes = []     # SAM2 워커에 올릴 (key, x1,y1,x2,y2)
                 seg_centers = []     # YOLO seg 가 처리한 객체 중심 (GD-only 중복 방지)
+                seg_boxes = []       # YOLO seg bbox — GD 박스가 이 안에 들면 같은 물체로 병합
                 # 1-9 선택용 인덱스 검출 리스트 (매 프레임 재수집; eye-in-hand 라
                 # base 좌표/cloud 는 현재 T_cam2base 로 매 프레임 새로 계산됨 — 캐싱 X)
                 self.detections = []
@@ -3570,8 +3600,14 @@ class WebcamSegNode(Node):
                                     _mm.astype(np.uint8), (vW, vH),
                                     interpolation=cv2.INTER_NEAREST) > 0
                             _mfull.append(_mm)
+                        # snack_bag(cls 2)는 캔/병을 저신뢰로 오분류하는 일 많음 →
+                        # 높은 conf 만 인정(WSN_SNACK_MIN_CONF, 기본 0.45). 실제 과자는 고신뢰라 유지,
+                        # 캔이 snack 으로 오분류돼 vertical 로 잡히는 것 차단. (bottle/can 은 낮은 conf 유지)
+                        _snack_min = float(os.environ.get('WSN_SNACK_MIN_CONF', '0.45'))
                         _keep = []
                         for _i in list(np.argsort(-confs)):
+                            if int(cls_ids[_i]) == 2 and float(confs[_i]) < _snack_min:
+                                continue
                             _ai = _mfull[_i]; _aa = int(_ai.sum()) + 1
                             _dup = False
                             for _j in _keep:
@@ -3684,6 +3720,11 @@ class WebcamSegNode(Node):
                                 continue
                             cu, cv_y, base_xyz = out
                             seg_centers.append((cu, cv_y))   # GD-only 중복 방지용
+                            try:
+                                seg_boxes.append((int(bbox[0]), int(bbox[1]),
+                                                  int(bbox[2]), int(bbox[3])))
+                            except Exception:
+                                pass
                             # ── [DBG_COORD] 이 물체가 실제로 읽는 depth vs base z.
                             # 캔이면 depth≈350mm(윗면)이어야 z≈+100. depth≈500(테이블)
                             # 이면 z 음수 = 캔 뒤를 읽는 것(반사 구멍).
@@ -3913,17 +3954,20 @@ class WebcamSegNode(Node):
                         if any(abs(gcx - sx) < 70 and abs(gcy - sy) < 70
                                for (sx, sy) in seg_centers):
                             continue                      # seg 가 이미 처리
+                        # GD 박스 중심이 YOLO bbox 안(20px 여유)이면 같은 물체 → 병합(skip).
+                        # 키 큰 캔에서 중심 70px 넘어도 박스 안이면 중복으로 처리.
+                        if any(bx[0]-20 <= gcx <= bx[2]+20 and bx[1]-20 <= gcy <= bx[3]+20
+                               for bx in seg_boxes):
+                            continue
                         if any(abs(gcx - dx) < 70 and abs(gcy - dy) < 70
                                for (dx, dy) in gd_done):
                             continue                      # GD 중복(같은 물체) skip
                         ph = str(g[4]).lower()
                         # 여긴 YOLO 가 못 잡은 GD-only 검출만 옴(위 seg_centers 필터).
-                        # 실제 bottle/can/bread 는 YOLO 가 처리 → 여기 도달 X.
-                        # 그래서 GD-only bottle/can = 뒤쪽 unknown 데코 → 'coffee' 로 통일.
-                        # (snack 은 YOLO 가 약해 GD 의존하므로 snack_bag 유지)
+                        # GD-only 도 실제 라벨(bottle/can/snack)로 등록 (coffee 제거).
                         cn = ('snack_bag' if 'snack' in ph
-                              else 'coffee' if ('coffee' in ph or 'bottle' in ph
-                                                or 'can' in ph)
+                              else 'bottle' if 'bottle' in ph
+                              else 'can' if 'can' in ph
                               else None)
                         if cn is None:
                             continue
@@ -3949,6 +3993,9 @@ class WebcamSegNode(Node):
                         pcx = (bb[0] + bb[2]) // 2; pcy = (bb[1] + bb[3]) // 2
                         if any(abs(pcx - sx) < 70 and abs(pcy - sy) < 70
                                for (sx, sy) in seg_centers):
+                            continue
+                        if any(bx[0]-20 <= pcx <= bx[2]+20 and bx[1]-20 <= pcy <= bx[3]+20
+                               for bx in seg_boxes):
                             continue
                         if any(abs(pcx - dx) < 70 and abs(pcy - dy) < 70
                                for (dx, dy) in gd_done):
@@ -3979,12 +4026,14 @@ class WebcamSegNode(Node):
                            if fps_ema else inst_fps)
                 n_det = 0 if (res is None or res.boxes is None) else len(res.boxes)
                 armed = ('`' in self.keys_held) and ('q' in self.keys_held)
-                # 검출 지속성: 이번 frame 에 놓친 seg 객체도 최근(0.6s) 봤으면 외곽선
-                # 유지 → 깜빡임 제거.
+                # 검출 지속성: 이번 frame 에 놓친 seg 객체도 최근 봤으면 외곽선 유지 →
+                # 깜빡임 제거. conf 낮아 YOLO 가 자주 놓치는 물체는 TTL 늘려 안정화.
+                # (WSN_OUTLINE_TTL, 기본 2.0s. 정적 장면이라 길게 둬도 OK)
                 if hasattr(self, '_outline_persist'):
                     _np = time.time()
+                    _ttl_o = float(os.environ.get('WSN_OUTLINE_TTL', '2.0'))
                     for _tk, (_t, _cl) in list(self._outline_persist.items()):
-                        if _np - _t > 0.6:
+                        if _np - _t > _ttl_o:
                             self._outline_persist.pop(_tk, None); continue
                         if _tk not in self._seg_seen:
                             self._pending_outlines.extend(_cl)
@@ -4018,9 +4067,19 @@ class WebcamSegNode(Node):
                     else:
                         _usednum = {v.get('num') for v in self._det_track.values()}
                         _num = next((n for n in range(1, 10) if n not in _usednum), 0)
+                    # ── 라벨 안정화: track별 최근 9프레임 다수결 (can↔bottle 깜빡임 제거).
+                    #   자동화에서 라벨이 흔들리면 안 되므로 다수결 라벨로 고정.
+                    _votes = list((_ex.get('votes') if _ex else None) or [])
+                    _votes.append(str(_d.get('name', '')))
+                    _votes = _votes[-9:]
+                    _maj = max(set(_votes), key=_votes.count)
+                    if _maj and _maj != _d.get('name'):
+                        _d['name'] = _maj
+                        _d['gg_label'] = to_graspgen_label(_maj)
                     _d['_tk'] = _best_tk
                     _d['num'] = _num
-                    self._det_track[_best_tk] = {'det': _d, 't': _now, 'num': _num}
+                    self._det_track[_best_tk] = {'det': _d, 't': _now,
+                                                 'num': _num, 'votes': _votes}
                 # 만료: 일반 2.5s. 단 잠긴 물체(locked_tk)는 만료 안 함(락 유지) —
                 # seg 가 한참 놓쳐도 LOCKED 표시·초록박스 안 사라지게.
                 for _k in [kk for kk, vv in self._det_track.items()
@@ -4121,7 +4180,7 @@ class WebcamSegNode(Node):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 200, 255) if armed else (0, 255, 0), 2)
                 cv2.putText(vis,
-                            'SPACE=E-STOP  a=AUTO  h=HOME  v=shelf-check  1-9=lock  g=graspgen  p=advance+grasp  r=cancel  q=quit',
+                            'SPACE=E-STOP  a=AUTO  o=open  h=HOME  v=shelf-check  1-9=lock  g=graspgen  p=advance+grasp  r=cancel  q=quit',
                             (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                             (0, 0, 255), 1)
                 if self.shelf_missing is not None:
@@ -4209,6 +4268,10 @@ class WebcamSegNode(Node):
                 if k == ord('a') and '`' not in self.keys_held:
                     # 'a': 전자동 진열 (v→없는제품→h→x작은순 파지→place→반복)
                     self.auto_restock()
+                if k == ord('o') and '`' not in self.keys_held:
+                    # 'o': 그리퍼 열기
+                    if self._gripper_open_call(label='key-o', position=0):
+                        self.get_logger().info('[o] 그리퍼 열기')
         finally:
             try:
                 self.key_listener.stop()

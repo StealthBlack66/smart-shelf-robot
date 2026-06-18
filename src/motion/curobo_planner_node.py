@@ -352,7 +352,10 @@ class ArmControllerNode(Node):
         pos, ori = pose.pose.position, pose.pose.orientation
         quat_wxyz = [ori.w, ori.x, ori.y, ori.z]
         LIFT_HEIGHT = 0.15  # m
-        STANDOFF = float(os.environ.get('CUROBO_PICK_STANDOFF', '0.06'))  # m, 축방향 후퇴거리 (s와 통일)
+        # 축방향 접근거리 — 물체별: snack 6cm(그대로), can/bottle 8cm (사용자 요청).
+        _cls = (self.grasp_class or '').lower()
+        STANDOFF = (float(os.environ.get('CUROBO_SNACK_STANDOFF', '0.06')) if 'snack' in _cls
+                    else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.08')))
 
         grasp = np.array([pos.x, pos.y, pos.z], dtype=float)
         if grasp[2] < self.TCP_Z_MIN:
@@ -428,6 +431,10 @@ class ArmControllerNode(Node):
         N = len(cands)
         if N == 0:
             return False
+        # 축방향 접근거리 — can/bottle 8cm (사용자 요청). snack 은 candidates 없어 여기 안 옴.
+        _cls = (self.grasp_class or '').lower()
+        _pgs = (float(os.environ.get('CUROBO_SNACK_STANDOFF', '0.06')) if 'snack' in _cls
+                else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.08')))
         _pl = np.zeros((1, N, 3), dtype=np.float32)
         _ql = np.zeros((1, N, 4), dtype=np.float32)
         for i, (p, q) in enumerate(cands):
@@ -448,7 +455,7 @@ class ArmControllerNode(Node):
             gres = self.motion_gen.plan_grasp(
                 start_state, gposes, MotionGenPlanConfig(max_attempts=4),
                 grasp_approach_offset=Pose.from_list(
-                    [0, 0, -self.PREGRASP_STANDOFF, 1, 0, 0, 0]),
+                    [0, 0, -_pgs, 1, 0, 0, 0]),
                 disable_collision_links=list(self.gripper_coll_links),
                 plan_grasp_to_retract=False)
         except Exception as e:
@@ -461,12 +468,12 @@ class ArmControllerNode(Node):
         self.get_logger().info(f"[goalset] 선택 후보 #{gi+1}/{N}")
         try:
             self.get_logger().info(
-                f"  → 2a) 프리그래스프 접근 (파지점 {self.PREGRASP_STANDOFF*100:.0f}cm 뒤로)")
+                f"  → 2a) 프리그래스프 접근 (파지점 {_pgs*100:.0f}cm 뒤로)")
             cmd_a = gres.approach_result.get_interpolated_plan().position.cpu().numpy()
             self.execute_spline(cmd_a)
             time.sleep(2.0)
             self.get_logger().info(
-                f"  → 2b) 축방향 {self.PREGRASP_STANDOFF*100:.0f}cm 쭉 전진해서 파지점 도달")
+                f"  → 2b) 축방향 {_pgs*100:.0f}cm 쭉 전진해서 파지점 도달")
             cmd_g = gres.grasp_result.get_interpolated_plan().position.cpu().numpy()
             self.execute_spline(cmd_g)
             time.sleep(1.5)
@@ -756,9 +763,10 @@ class ArmControllerNode(Node):
     # ── Doosan 실행 ───────────────────────────────────────────
 
     def execute_spline(self, traj_rad, vel_scale: float = 1.0):
-        """[단발 movej] cuRobo 궤적 끝점까지 movej 한 번으로 이동 = 홈 이동과 동일 방식
-        → 한 개의 매끄러운 사다리꼴 속도프로파일이라 끊김 없음. (movesj=hang, 다점
-        movej=서로 덮어써 끊김 → 단발 movej 가 가장 부드럽고 확실. 2026-06-17)"""
+        """[단발 movej + joint1 우선] cuRobo 궤적 끝점까지 movej.
+        ★joint1(베이스)이 크게 움직이면 베이스만 먼저 회전 후 나머지 이동 →
+        하강 중 동시이동으로 대각선 sweep 하다 박는 것 방지 (사용자 요청 2026-06-18).
+        (movesj=hang / 다점 movej=끊김 → 단발 movej 가 가장 부드럽고 확실)"""
         if not self.cli_movej.wait_for_service(timeout_sec=3.0):
             self.get_logger().error("MoveJoint 서비스 없음")
             return False
@@ -767,31 +775,44 @@ class ArmControllerNode(Node):
         target_rad = np.asarray(traj_rad[-1], dtype=float)
         vel_deg = float(os.environ.get('CUROBO_SPLINE_VEL', '70')) * self.VEL_SCALE * float(vel_scale)
         acc_deg = float(os.environ.get('CUROBO_SPLINE_ACC', '150')) * self.VEL_SCALE
-        req = MoveJoint.Request()
-        req.pos = target_deg; req.vel = vel_deg; req.acc = acc_deg
-        req.time = 0.0; req.radius = 0.0; req.mode = 0
-        req.blend_type = 0; req.sync_type = 0
-        self.get_logger().info(
-            f"모션(단발 movej) → end={[f'{v:.1f}' for v in target_deg]} vel={vel_deg:.0f}°/s")
-        self.cli_movej.call_async(req)
-        # 실제 관절 도달 대기 (movej sync_type=0 은 접수 즉시 반환 → joint_states 로 판정)
-        t0 = time.time(); reached = False; last_log = 0.0
-        while time.time() - t0 < 40.0:
+
+        def _movej_wait(pos_deg, tgt_rad, label, to=40.0):
+            req = MoveJoint.Request()
+            req.pos = [float(v) for v in pos_deg]; req.vel = vel_deg; req.acc = acc_deg
+            req.time = 0.0; req.radius = 0.0; req.mode = 0
+            req.blend_type = 0; req.sync_type = 0
+            self.get_logger().info(f"모션({label}) → {[f'{v:.1f}' for v in pos_deg]} vel={vel_deg:.0f}°/s")
+            self.cli_movej.call_async(req)
+            t0 = time.time(); last = 0.0
+            while time.time() - t0 < to:
+                cj = self.current_joints
+                if cj is not None:
+                    err = float(np.max(np.abs(np.asarray(cj, dtype=float) - tgt_rad)))
+                    if err < np.radians(3.5):
+                        return True
+                    if time.time() - t0 - last > 5.0:
+                        last = time.time() - t0
+                        self.get_logger().info(f"  진행중... 도달오차 {np.degrees(err):.1f}° ({last:.0f}s)")
+                time.sleep(0.1)
+            return False
+
+        # ── joint1(베이스) 먼저: 하강 중 동시이동 sweep 충돌 방지.
+        #   joint1 이 임계(CUROBO_J1_FIRST_MIN, 기본 5°) 이상 변하면 베이스만 먼저 회전.
+        if os.environ.get('CUROBO_J1_FIRST', '1') != '0':
             cj = self.current_joints
             if cj is not None:
-                err = float(np.max(np.abs(np.asarray(cj, dtype=float) - target_rad)))
-                if err < np.radians(3.5):
-                    reached = True; break
-                if time.time() - t0 - last_log > 5.0:
-                    last_log = time.time() - t0
+                cj = np.asarray(cj, dtype=float)
+                _dj1 = abs(float(np.degrees(target_rad[0] - cj[0])))
+                if _dj1 > float(os.environ.get('CUROBO_J1_FIRST_MIN', '5')):
+                    _s1_deg = list(np.degrees(cj)); _s1_deg[0] = target_deg[0]
+                    _s1_rad = cj.copy(); _s1_rad[0] = target_rad[0]
                     self.get_logger().info(
-                        f"  모션 진행중... 도달오차 {np.degrees(err):.1f}° ({last_log:.0f}s)")
-            time.sleep(0.1)
-        cj = self.current_joints
-        self.get_logger().info(
-            "모션 " + ("완료" if reached else "실패(미도달)") +
-            (f" (도달오차 {np.degrees(float(np.max(np.abs(np.asarray(cj,dtype=float)-target_rad)))):.1f}°)"
-             if cj is not None else ""))
+                        f"  [joint1 우선] 베이스 {np.degrees(cj[0]):.0f}→{target_deg[0]:.0f}° 먼저 회전")
+                    _movej_wait(_s1_deg, _s1_rad, "joint1 우선", to=25.0)
+                    time.sleep(0.3)
+        # ── 전체 목표
+        reached = _movej_wait(target_deg, target_rad, "전체", to=40.0)
+        self.get_logger().info("모션 " + ("완료" if reached else "실패(미도달)"))
         return reached
 
     def _execute_movej(self, joints_deg, vel: float = 30.0, acc: float = 30.0) -> bool:
