@@ -38,6 +38,7 @@ from geometry_msgs.msg import PoseStamped, PoseArray
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from sensor_msgs.msg import JointState
+from visualization_msgs.msg import Marker, MarkerArray   # 충돌구체 RViz 시각화
 
 from curobo.types.base import TensorDeviceType
 from curobo.types.robot import JointState as CuroboJointState, RobotConfig
@@ -148,6 +149,13 @@ class ArmControllerNode(Node):
 
         self.grasp_force_params = self._load_grasp_force_params(config_dir)
         self._load_place_targets(config_dir)
+
+        # ★충돌구체 시각화 — current_joints 의 cuRobo 충돌 sphere 를 MarkerArray 로 발행
+        #   (대시보드 RViz 화면에 로봇 충돌모델 표시용). 5Hz 타이머.
+        self.pub_spheres = self.create_publisher(
+            MarkerArray, '/dsr01/curobo/collision_spheres', 1)
+        self._sphere_frame = os.environ.get('CUROBO_SPHERE_FRAME', 'base_link')
+        self._sphere_timer = self.create_timer(0.2, self._publish_collision_spheres)
 
         # Subscribers
         self.create_subscription(JointState, '/dsr01/joint_states',
@@ -268,6 +276,46 @@ class ArmControllerNode(Node):
         joints = [joint_map.get(n) for n in self.JOINT_NAMES]
         if None not in joints:
             self.current_joints = joints
+
+    def _publish_collision_spheres(self):
+        """현재 관절의 cuRobo 충돌 sphere 를 MarkerArray 로 발행 → RViz 표시."""
+        if self.current_joints is None or self.motion_gen is None:
+            return
+        try:
+            import torch
+            q = self.tensor_args.to_device(
+                torch.tensor([list(self.current_joints)], dtype=torch.float32))
+            kin = self.motion_gen.kinematics.get_state(q)
+            sph = kin.link_spheres_tensor[0].detach().cpu().numpy()  # [n,4] x,y,z,r
+        except Exception as e:
+            if not getattr(self, '_sph_warned', False):
+                self.get_logger().warn(f"[spheres] cuRobo sphere 계산 실패: {e}")
+                self._sph_warned = True
+            return
+        ma = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        for i, s in enumerate(sph):
+            r = float(s[3])
+            if r <= 0.0:
+                continue
+            m = Marker()
+            m.header.frame_id = self._sphere_frame
+            m.header.stamp = now
+            m.ns = 'curobo_spheres'
+            m.id = int(i)
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(s[0])
+            m.pose.position.y = float(s[1])
+            m.pose.position.z = float(s[2])
+            m.pose.orientation.w = 1.0
+            m.scale.x = m.scale.y = m.scale.z = 2.0 * r   # 지름
+            m.color.r = 0.1; m.color.g = 0.8; m.color.b = 1.0; m.color.a = 0.35
+            m.lifetime.sec = 0
+            m.lifetime.nanosec = 500000000   # 0.5s — 발행 멈추면 자동 소거
+            ma.markers.append(m)
+        if ma.markers:
+            self.pub_spheres.publish(ma)
 
     def _grasp_class_cb(self, msg: String):
         self.grasp_class = msg.data.strip() or None

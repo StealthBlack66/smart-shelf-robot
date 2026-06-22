@@ -19,8 +19,9 @@ export function OperatorPanel({ state }: { state: string }) {
       right={<span className={`state-pill state-${state}`}>{state}</span>}>
       <div className="muted" style={{ marginBottom: 6 }}>사이클 시작</div>
       <div className="btn-row">
-        <button className={is('IDLE') ? 'primary' : ''}
-          onClick={() => send('start')}>▶ START</button>
+        <button className="danger"
+          style={{ width: '100%', fontSize: 18, fontWeight: 700, padding: '14px 20px' }}
+          onClick={() => send('start')}>🟥 매대 정리 시작</button>
       </div>
 
       <label className="field">보충 대상 선택 (SHELF_DETECTING 통과)</label>

@@ -47,6 +47,7 @@ export interface VisionState {
   grasp_candidates: Pose[]
   obstacles: string | null
   shelf_slots: string[]
+  shelf_inventory: { can: number; bottle: number; snack: number }
 }
 
 export interface Snapshot {

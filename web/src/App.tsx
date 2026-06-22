@@ -2,9 +2,7 @@ import { useTelemetry } from './hooks/useTelemetry'
 import { Panel, Pill, KV, Stat, Gauge } from './components/common'
 import { CurrentChart } from './components/CurrentChart'
 import { CameraFeed } from './components/CameraFeed'
-import { ControlPanel } from './components/ControlPanel'
 import { OperatorPanel } from './components/OperatorPanel'
-import { LogsPanel } from './components/LogsPanel'
 import { api } from './api'
 import type { Snapshot } from './types'
 
@@ -85,56 +83,33 @@ function GripperPanel({ s }: { s: Snapshot }) {
   )
 }
 
-function VisionPanel({ s }: { s: Snapshot }) {
-  const v = s.vision
-  const slots = v.shelf_slots.length ? v.shelf_slots : Array(6).fill('unknown')
-  const p = v.pick_pose?.position
+function RvizPanel() {
+  // RViz 3D 화면(로봇모델 + cuRobo 충돌구체) MJPEG 스트림
   return (
-    <Panel title="비전 상태" className="col-4"
-      right={v.grasp_class ? <span className="tag">{v.grasp_class}</span> : <span className="muted">미감지</span>}>
-      <div className="muted" style={{ marginBottom: 6 }}>매대 슬롯 점유 (0~5)</div>
-      <div className="slots">
-        {slots.slice(0, 6).map((st, i) => (
-          <div key={i} className={`slot ${st === 'occupied' ? 'occupied' : st === 'empty' ? 'empty' : ''}`}>
-            <span className="idx">SLOT {i}</span>
-            <span>{st === 'unknown' ? '—' : st === 'occupied' ? '점유' : '비움'}</span>
-          </div>
-        ))}
+    <Panel title="RViz — 충돌구체 3D 뷰" className="col-4"
+      right={<span className="tag">collision spheres</span>}>
+      <div className="camera">
+        <img src="/api/rviz/stream" alt="rviz collision spheres view"
+          style={{ width: '100%', display: 'block', borderRadius: 8 }} />
       </div>
-      <hr style={{ borderColor: 'var(--border)', margin: '12px 0' }} />
-      <div className="muted" style={{ marginBottom: 6 }}>감지 3D 위치 (pick)</div>
-      {p ? (
-        <div className="row3">
-          <KV k="x" v={p.x.toFixed(3)} />
-          <KV k="y" v={p.y.toFixed(3)} />
-          <KV k="z" v={p.z.toFixed(3)} />
-        </div>
-      ) : <div className="muted">pick_pose 없음</div>}
-      <KV k="후보 수" v={v.grasp_candidates.length} />
-      {v.obstacles && <KV k="장애물" v={<span className="tag">{v.obstacles}</span>} />}
     </Panel>
   )
 }
 
-function MetricsPanel({ m }: { m: import('./types').Metrics }) {
-  const pct = (v: number | null) => (v == null ? '—' : `${v}%`)
-  const tone = (v: number | null) => (v == null ? undefined : v >= 80 ? 'ok' : v >= 50 ? 'warn' : 'err')
+function ShelfInventoryPanel({ s }: { s: Snapshot }) {
+  // 매대 물품 품목: 캔/바틀/스낵 (처음 매대확인 시 있으면 1, 없으면 0; 진열하면 1)
+  const inv = s.vision.shelf_inventory ?? { can: 0, bottle: 0, snack: 0 }
+  const items: [string, number][] = [
+    ['캔 (can)', inv.can],
+    ['바틀 (bottle)', inv.bottle],
+    ['스낵 (snack)', inv.snack],
+  ]
   return (
-    <Panel title="작업 성능 지표" className="col-8"
-      right={<button className="ghost" onClick={() => { if (confirm('지표 초기화?')) api.resetMetrics() }}>초기화</button>}>
+    <Panel title="매대 물품 품목" className="col-8">
       <div className="stat-grid">
-        <Stat label="총 시도" value={m.attempts} />
-        <Stat label="파지 성공률 (전류)" value={pct(m.grasp_success_rate_current)} tone={tone(m.grasp_success_rate_current)} />
-        <Stat label="파지 성공률 (자세)" value={pct(m.grasp_success_rate_pose)} tone={tone(m.grasp_success_rate_pose)} />
-        <Stat label="Place 성공률" value={pct(m.place_success_rate)} tone={tone(m.place_success_rate)} />
-        <Stat label="평균 택타임" value={m.avg_tact_time == null ? '—' : `${m.avg_tact_time}s`} />
-        <Stat label="ERROR 발생" value={m.error_count} tone={m.error_count > 0 ? 'err' : 'ok'} />
-      </div>
-      <div className="btn-row" style={{ marginTop: 12 }}>
-        <button onClick={() => api.cycleStart()}>사이클 시작</button>
-        <button onClick={() => api.cycleEnd(true)}>사이클 종료</button>
-        <button onClick={() => api.markPlace(true)}>Place 성공 기록</button>
-        <button onClick={() => api.markPlace(false)}>Place 실패 기록</button>
+        {items.map(([label, n]) => (
+          <Stat key={label} label={label} value={`${n}개`} tone={n > 0 ? 'ok' : 'warn'} />
+        ))}
       </div>
     </Panel>
   )
@@ -166,16 +141,13 @@ export default function App() {
           <Panel title="카메라 라이브 피드" className="col-5">
             <CameraFeed available={data.camera_available} />
           </Panel>
-          <VisionPanel s={data.snapshot} />
+          <RvizPanel />
           <Panel title="그리퍼 전류 (최근 10s)" className="col-3">
             <CurrentChart data={data.current_series} />
           </Panel>
 
-          <MetricsPanel m={data.metrics} />
-          <ControlPanel gripper={data.snapshot.gripper} />
+          <ShelfInventoryPanel s={data.snapshot} />
           <OperatorPanel state={data.snapshot.state} />
-
-          <LogsPanel />
         </div>
       )}
     </>

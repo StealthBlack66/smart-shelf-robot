@@ -491,6 +491,7 @@ from geometry_msgs.msg import PoseStamped, Point, PoseArray, Pose
 from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import Trigger
 from visualization_msgs.msg import Marker
+from sensor_msgs.msg import CompressedImage   # 대시보드 카메라 피드 발행용
 try:
     from dsr_gripper_tcp_interfaces.srv import SetPosition  # 그리퍼 열기(브리지)
     _SETPOS_AVAIL = True
@@ -688,6 +689,9 @@ class WebcamSegNode(Node):
         self.gd_text_thr = float(self.get_parameter('gd_text_thr').value)
         self.gd_results  = []
         self.gd_lock     = threading.Lock()
+        # 매대확인용: YOLO seg 원본 2D 검출 [(name, conf), ...]. depth 투영 전이라
+        #   매대(먼 거리)에서도 잡힘 — self.detections는 depth 필요해 매대거리서 비어버림.
+        self.yolo_seg_results = []
         self.gd_busy     = False
         self.gd_last_t   = 0.0
         gd_cfg = self.get_parameter('gd_config').value
@@ -873,6 +877,14 @@ class WebcamSegNode(Node):
         self.pub_obstacles   = self.create_publisher(String,      '/dsr01/curobo/obstacles',   10)
         # ★대시보드 "매대 정리 시작" 버튼 → /dashboard/operator_cmd 구독 → 'a'(auto_restock) 트리거
         self.create_subscription(String, '/dashboard/operator_cmd', self._operator_cmd_cb, 10)
+        # ★대시보드 카메라 라이브 피드 — 화면(vis_show)을 JPEG CompressedImage 로 발행
+        self.pub_dash_cam = self.create_publisher(
+            CompressedImage, '/dashboard/camera/compressed', 1)
+        self._dash_cam_n = 0
+        # ★대시보드 매대 품목 재고 (캔/바틀/스낵 각 0/1) — 매대확인+진열로 갱신해 발행
+        self.pub_shelf_inv = self.create_publisher(
+            String, '/dashboard/shelf_inventory', 1)
+        self.shelf_inv = {'can': 0, 'bottle': 0, 'snack': 0}
         self.cli_open = (self.create_client(
             SetPosition, '/gripper_service/set_position',
             callback_group=cb_group) if _SETPOS_AVAIL else None)
@@ -1854,6 +1866,10 @@ class WebcamSegNode(Node):
                 self.locked = False; self.locked_tk = None
                 self.clear_grasp_preview()
                 remaining.remove(mk)
+                # 대시보드 매대 재고: 진열(옮김) 완료한 품목 → 1
+                if mk in self.shelf_inv:
+                    self.shelf_inv[mk] = 1
+                    self._publish_shelf_inv()
                 log.info(f'[auto] {mk} 진열 완료. 남은: {remaining}')
 
             log.info(f'[auto] ===== 자동 진열 종료 (남은: {remaining if remaining else "없음"}) =====')
@@ -1861,6 +1877,15 @@ class WebcamSegNode(Node):
             log.error(f'[auto] 예외 — 중단: {e}')
         finally:
             self._auto_running = False
+            # ★락/미리보기 보장 해제 — 예외·중단으로 빠져나가도 stuck-lock(전부 빨강 OBS,
+            #   SEL 없음, 장애물 계속 발행) 방지. auto 끝나면 무조건 풀린 상태로. (2026-06-22)
+            self.locked = False
+            self.locked_tk = None
+            self.locked_idx = None
+            try:
+                self.clear_grasp_preview()
+            except Exception:
+                pass
 
     def _go_shelf_and_check(self):
         """'v' 키: home(매대뷰) 자세로 이동 → 도착 후 매대재고 확인.
@@ -1895,34 +1920,62 @@ class WebcamSegNode(Node):
                         stable = 0
                     last = p
                 time.sleep(0.1)
-            self.get_logger().info("[v] 매대뷰 도착 — 매대재고 확인")
-            time.sleep(1.0)   # 영상/검출 안정
+            self.get_logger().info("[v] 매대뷰 도착 — 매대재고 확인 (3초 안정화 판정)")
+            time.sleep(0.3)   # 짧은 settle (실제 판정은 아래 3초 멀티프레임 최댓값)
             self.shelf_inventory_check()
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def shelf_inventory_check(self):
         """'v' 키: 매대(홈뷰)에서 3종 제품(bottle/can/snack) present/absent 판정.
-        매대에 없는(검출 안 되는) 제품 = 바닥에서 집어야 할 것. conf threshold(WSN_SHELF_CONF,
-        기본 0.55)로 빈칸 구조물 오검출(보통 ~0.4) 제거 → 실제 제품(0.8+)만 present."""
-        thr = float(os.environ.get('WSN_SHELF_CONF', '0.55'))
-        with self.gd_lock:
-            dets = list(self.gd_results)
-        KW = {'bottle': ('bottle',), 'can': ('can',), 'snack': ('snack',)}
-        best = {k: 0.0 for k in KW}
-        for r in dets:
-            cls = str(r[4]).lower(); conf = float(r[5])
-            for k, kws in KW.items():
-                if any(w in cls for w in kws):
-                    best[k] = max(best[k], conf)
-        present = {k: (best[k] >= thr) for k in KW}
+        ★fine-tuned YOLO '원본 2D 검출'(self.yolo_seg_results) 사용. self.detections 는 depth
+        투영이 필요해서 매대(먼 거리)에선 비어버림(tracks=0) → present/absent 못 봄. 원본 2D 는
+        depth 불필요라 먼 매대도 잡히고, 학습모델이라 배경(소화기 등) 오검출도 없음.
+        N초간 보고 프레임 다수에서 보이면 present (깜빡임 무시). (WSN_SHELF_VIEW_SEC 기본 5초)"""
+        view_sec = float(os.environ.get('WSN_SHELF_VIEW_SEC', '5.0'))
+        thr = float(os.environ.get('WSN_SHELF_CONF', '0.45'))
+        KW = {'bottle': ('bottle', 'pet'), 'can': ('can',), 'snack': ('snack',)}
+        seen = {k: 0 for k in KW}
+        _frames = 0
+        t0 = time.time()
+        while time.time() - t0 < view_sec:
+            ys = list(getattr(self, 'yolo_seg_results', []))   # 학습 YOLO 원본 2D [(name,conf)]
+            _frames += 1
+            _hit = {k: False for k in KW}
+            for (nm, cf) in ys:
+                if cf < thr:
+                    continue
+                nml = str(nm).lower()
+                for k, kws in KW.items():
+                    if any(w in nml for w in kws):
+                        _hit[k] = True
+            for k in KW:
+                if _hit[k]:
+                    seen[k] += 1
+            time.sleep(0.15)
+        # 전체 프레임의 20% 이상(최소 2프레임) 보이면 present — 한두 프레임 깜빡임은 무시
+        need = max(2, int(_frames * 0.2))
+        present = {k: (seen[k] >= need) for k in KW}
         missing = [k for k in KW if not present[k]]
         self.shelf_missing = missing
+        # 대시보드 매대 재고: 처음 매대 갔을 때 있으면 1, 없으면 0
+        for k in KW:
+            self.shelf_inv[k] = 1 if present[k] else 0
+        self._publish_shelf_inv()
         self.get_logger().info(
-            "[매대재고] " + "  ".join(
-                f"{k}={'O' if present[k] else 'X'}({best[k]:.2f})" for k in KW)
+            f"[매대재고] (YOLO2D {view_sec:.0f}s/{_frames}프레임 conf>={thr}, present>={need}) "
+            + "  ".join(f"{k}={'O' if present[k] else 'X'}({seen[k]}/{_frames})" for k in KW)
             + f"  → 바닥에서 집을것={missing if missing else '없음(다 채워짐)'}")
         return missing
+
+    def _publish_shelf_inv(self):
+        """매대 재고(캔/바틀/스낵 0/1) JSON 을 대시보드로 발행."""
+        try:
+            import json
+            m = String(); m.data = json.dumps(self.shelf_inv)
+            self.pub_shelf_inv.publish(m)
+        except Exception:
+            pass
 
     def _snack_topdown_grasp(self, det, cloud):
         """과자봉지: 검출 중심에서 수직(top-down) 파지. approach=-Z, 핑거축=봉지 장축(rz).
@@ -1983,15 +2036,32 @@ class WebcamSegNode(Node):
         #   서있는 캔/바틀은 옆면 수평 파지(아래 기본 로직)지만, 누우면 위에서 수직으로 잡아야 함.
         #   center_base z 가 WSN_CYL_LIE_Z(기본 5.5cm) 미만이면 바닥에 누운 것으로 간주.
         #   _snack_topdown_grasp 가 top-down(approach=-Z, 핑거축=장축) 템플릿이라 그대로 재활용.
+        # ★2단계 누움 판정 (사용자 2026-06-22): ① center z 먼저 — 높으면 확실히 서있음.
+        #   ② z 가 낮으면(누움 의심) SAM 포인트클라우드 주축(PCA)으로 확인 — 주축이 수평이면
+        #   진짜 누움(top-down), 수직이면 서있는데 z 만 낮게 읽힌 것(반투명 바틀이 테이블 읽음)
+        #   → 옆면 파지. z 단독 오판(반투명 바틀이 뒤 테이블 읽어 낮게 나옴) 을 축으로 교정.
         _is_cyl0 = (det.get('gg_label') in ('can', 'pet_bottle')
                     or 'can' in _nm0 or 'bottle' in _nm0)
         _cz = float(np.asarray(det.get('center_base', [0, 0, 1.0]), dtype=float)[2])
         _lie_th = float(os.environ.get('WSN_CYL_LIE_Z', '0.055'))   # 5.5cm
         if _is_cyl0 and _cz < _lie_th:
-            self.get_logger().info(
-                f"[g] 캔/바틀 누움 감지 (z={_cz*100:.1f}cm < {_lie_th*100:.1f}cm) → 수직 top-down 파지")
-            self._snack_topdown_grasp(det, cloud)   # 위에서 수직 중심 파지 (누운 원통)
-            return
+            # z 낮음(누움 의심) → SAM 포인트클라우드 주축으로 진짜 누움인지 확인
+            _axv = 1.0; _why = f"z={_cz*100:.1f}cm"
+            try:
+                _cc = np.asarray(cloud, dtype=float)
+                if _cc.ndim == 2 and len(_cc) >= 20:
+                    _, _, _vt = np.linalg.svd(_cc - _cc.mean(axis=0), full_matrices=False)
+                    _axv = abs(float(_vt[0][2]))    # 주축 수직성분 (1=수직=서있음, 0=수평=누움)
+                    _why = f"z={_cz*100:.1f}cm axisZ={_axv:.2f}"
+            except Exception as _e:
+                _axv = 0.0; _why = f"z={_cz*100:.1f}cm PCA실패({_e})"
+            _vth = float(os.environ.get('WSN_LIE_AXIS_VERT', '0.5'))
+            if _axv < _vth:      # 주축 수평 = 진짜 누움 → top-down
+                self.get_logger().info(f"[g] {_nm0} 누움 확정 ({_why}) → 수직 top-down 파지")
+                self._snack_topdown_grasp(det, cloud)   # 위에서 수직 중심 파지 (누운 원통)
+                return
+            else:                # 주축 수직 = 서있음(z만 낮게 읽힘, 반투명) → 옆면 파지
+                self.get_logger().info(f"[g] {_nm0} z낮지만 축 수직=서있음 ({_why}) → 옆면 파지")
         center = cloud.mean(axis=0)
         pc = (cloud - center).astype(np.float32)   # 중심정규화 후 추론
         try:
@@ -2081,7 +2151,13 @@ class WebcamSegNode(Node):
         # 앵커 = 안정적인 캔 검출 중심 C (GraspGen pos 는 노이즈 심해 안 씀).
         C = np.asarray(det.get('center_base'), dtype=float)
         if self.grasp_fixed_z is not None:
-            C[2] = self.grasp_fixed_z   # 잡는 높이 고정 (검출 z 무시)
+            # ★bottle 은 키 커서 더 높이 잡음(z=70mm) → 낮은 자세 도달실패 회피. 캔 등은 기본(57.5).
+            #   (사용자 2026-06-22). WSN_GRASP_FIXED_Z_BOTTLE 로 조정.
+            _nm = str(det.get('name', '')).lower()
+            if 'bottle' in _nm:
+                C[2] = float(os.environ.get('WSN_GRASP_FIXED_Z_BOTTLE', '70')) / 1000.0
+            else:
+                C[2] = self.grasp_fixed_z   # 잡는 높이 고정 (검출 z 무시)
         # ★X축 오프셋은 더 이상 C 에 섞지 않음 — curobo 가 '축방향 전진 전에' 별도 단계로
         #   월드 X 0.5cm 옆이동(CUROBO_PICK_X_SHIFT). C 에 섞으면 cuRobo 전진경로가
         #   X 로 갔다 돌아오며 흔들려서(사용자 지적 2026-06-18) 분리함. 여기선 C=물체중심.
@@ -3071,6 +3147,16 @@ class WebcamSegNode(Node):
                         frame, conf=self.conf, iou=self.iou,
                         imgsz=self.imgsz, verbose=False)[0]
                     vis = frame.copy()
+                    # 매대확인용 원본 2D(클래스+conf) 저장 — depth 투영 전이라 먼 매대도 잡힘
+                    try:
+                        _ys = []
+                        if res is not None and res.boxes is not None:
+                            for _b in res.boxes:
+                                _ys.append((str(self.yolo.names[int(_b.cls)]),
+                                            float(_b.conf)))
+                        self.yolo_seg_results = _ys
+                    except Exception:
+                        self.yolo_seg_results = []
                 else:
                     res = None
                     vis = frame.copy()
@@ -3557,11 +3643,24 @@ class WebcamSegNode(Node):
                 #   매대뷰에서 화면엔 없는데 '있다'고 판정되는 GD 오검출을 눈으로 확인 가능. WSN_GD_VIZ=0 끔.
                 if os.environ.get('WSN_GD_VIZ', '1') != '0':
                     _sthr = float(os.environ.get('WSN_SHELF_CONF', '0.55'))
+                    _smax = float(os.environ.get('WSN_SHELF_MAX_MM', '1000'))
+                    _dep = getattr(self, '_last_depth', None)
                     with self.gd_lock:
                         _gdv = list(self.gd_results)
                     for _r in _gdv:
                         gx1, gy1, gx2, gy2, gph, gcf = (int(_r[0]), int(_r[1]), int(_r[2]),
                                                         int(_r[3]), str(_r[4]), float(_r[5]))
+                        # ★far(배경) GD 는 화면에도 안 그림 (매대점검 depth 기준과 동일). 사용자 2026-06-22
+                        if _dep is not None:
+                            _cu = (gx1 + gx2) // 2; _cv = (gy1 + gy2) // 2
+                            _Hd, _Wd = _dep.shape[:2]
+                            _dmm = 0.0
+                            if 0 <= _cv < _Hd and 0 <= _cu < _Wd:
+                                _pt = _dep[max(0, _cv-4):_cv+5, max(0, _cu-4):_cu+5]
+                                _vd = _pt[_pt > 0]
+                                _dmm = float(np.median(_vd)) if _vd.size else 0.0
+                            if _dmm <= 0 or _dmm > _smax:
+                                continue   # 배경(멀거나 depth무효) → 화면 표시 안 함
                         _on = (gcf >= _sthr)
                         _gc = (0, 140, 255) if _on else (110, 130, 160)   # 밝은주황 vs 흐림
                         cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), _gc, 2)
@@ -4176,7 +4275,8 @@ class WebcamSegNode(Node):
                     self.get_logger().info(
                         f"[DBG_DET] tracks={len(self.detections)} {_info} "
                         f"| depth_clusters={len(_dobs)} "
-                        f"{[[round(o['pos'][0]*1000),round(o['pos'][1]*1000)] for o in _dobs]}")
+                        f"{[[round(o['pos'][0]*1000),round(o['pos'][1]*1000)] for o in _dobs]} "
+                        f"| YOLO2D={[(n, round(c,2)) for (n,c) in getattr(self,'yolo_seg_results',[])]}")
                 # 잠긴 물체를 인덱스가 아닌 트랙키(위치)로 추종 → 리스트가 재정렬돼도 유지
                 if self.locked and self.locked_tk is not None:
                     if self.locked_tk in self._det_track:
@@ -4188,6 +4288,26 @@ class WebcamSegNode(Node):
                     else:
                         self.locked_idx = None
 
+                # ★락 무결성 — locked인데 현재 검출에 유효 SEL 타깃이 없으면(키 None/유령/
+                #   트랙 churn) 같은 클래스 실물로 재획득. 그래도 없고 auto 아니면 자동 언락.
+                #   → "전부 빨강 OBS·아무것도 SEL 안 됨" stuck 원천 차단. (2026-06-22)
+                _valid_lock = (self.locked and self.locked_tk is not None
+                               and any(_dd.get('_tk') == self.locked_tk
+                                       for _dd in self.detections))
+                if self.locked and not _valid_lock \
+                        and not getattr(self, '_auto_running', False):
+                    _reacq = next((_dd for _dd in self.detections
+                                   if self.locked_class
+                                   and str(_dd.get('name', '')) == self.locked_class),
+                                  None)
+                    if _reacq is not None:
+                        self.locked_tk = _reacq.get('_tk')      # 재획득 → SEL 복구
+                        _valid_lock = True
+                    else:
+                        self.locked = False; self.locked_tk = None
+                        self.locked_idx = None
+                        self.get_logger().info('[lock] 유효 타깃 없음 → 자동 언락')
+
                 # ── 고정 번호(num) 표시 + lock 하이라이트 (선택은 트랙키 기준) ──
                 for _d in self.detections:
                     _x1, _y1, _x2, _y2 = _d['bbox']
@@ -4198,7 +4318,7 @@ class WebcamSegNode(Node):
                     _num = _d.get('num', '?')
                     if _is_sel:
                         _col = (0, 255, 0); _lab = f"[{_num}] {_nm} <SEL>"
-                    elif self.locked:
+                    elif _valid_lock:                # 진짜 타깃 있을 때만 나머지=장애물
                         _col = (0, 0, 255)            # 빨강 = curobo 장애물
                         _lab = f"[{_num}] {_nm} OBS"
                     else:
@@ -4208,7 +4328,8 @@ class WebcamSegNode(Node):
                     cv2.putText(vis, _lab, (_x1, _y1 - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, _col, 2)
                 # 락 중이면 장애물 상시 발행(~3Hz) — s/p 순간 외에도 curobo world 최신 유지
-                if self.locked and self._selected() is not None:
+                # (유효 SEL 타깃이 있을 때만 — 끊긴 락으로 엉뚱한 장애물 발행 방지)
+                if _valid_lock and self._selected() is not None:
                     if now - getattr(self, '_last_obs_pub', 0.0) > 0.33:
                         self._publish_obstacles(self._selected(), log=False)
                         self._last_obs_pub = now
@@ -4286,6 +4407,27 @@ class WebcamSegNode(Node):
                     vis, (self._show_w, self._show_h),
                     interpolation=cv2.INTER_LINEAR)
                 cv2.imshow(self.win, vis_show)
+                # ★대시보드 카메라 피드: 2프레임마다 JPEG 발행(대역폭 절감)
+                self._dash_cam_n += 1
+                if self._dash_cam_n % 2 == 0:
+                    try:
+                        _ok, _jpg = cv2.imencode(
+                            '.jpg', vis_show, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        if _ok:
+                            _cm = CompressedImage()
+                            _cm.format = 'jpeg'
+                            _cm.data = _jpg.tobytes()
+                            self.pub_dash_cam.publish(_cm)
+                    except Exception:
+                        pass
+                if os.environ.get('WSN_DUMP_FRAME', '0') != '0':   # 디버그: 화면을 파일로(원격확인)
+                    self._frame_dump_n = getattr(self, '_frame_dump_n', 0) + 1
+                    if self._frame_dump_n % 8 == 0:
+                        try:
+                            cv2.imwrite('/tmp/webcam_latest.jpg', vis_show,
+                                        [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        except Exception:
+                            pass
                 k = cv2.waitKey(1) & 0xFF
                 if k == 32:   # 🛑 스페이스바 = 비상정지 (창 포커스 시 백업; pynput 이 OS레벨 주)
                     self._emergency_stop()

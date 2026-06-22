@@ -100,6 +100,8 @@ class StateStore:
         self.grasp_candidates: list[dict] = []
         self.obstacles: Optional[str] = None
         self.shelf_slots: list[str] = []            # 슬롯 점유(미배선 시 빈 배열)
+        # 매대 품목 재고 (캔/바틀/스낵, 각 0/1). 매대확인 결과 + 진열(place)로 갱신
+        self.shelf_inventory: dict = {'can': 0, 'bottle': 0, 'snack': 0}
 
         # 의사 상태머신 / 에러 로그 링버퍼
         self.error_log: deque[dict] = deque(maxlen=200)
@@ -148,6 +150,16 @@ class StateStore:
     def set_obstacles(self, v: str) -> None:
         with self._lock:
             self.obstacles = v
+            self._touch('vision')
+
+    def set_shelf_inventory(self, inv: dict) -> None:
+        with self._lock:
+            for k in ('can', 'bottle', 'snack'):
+                if k in inv:
+                    try:
+                        self.shelf_inventory[k] = int(inv[k])
+                    except Exception:
+                        pass
             self._touch('vision')
 
     def add_error(self, entry: dict) -> None:
@@ -218,6 +230,7 @@ class StateStore:
                     'grasp_candidates': self.grasp_candidates,
                     'obstacles': self.obstacles,
                     'shelf_slots': self.shelf_slots,
+                    'shelf_inventory': dict(self.shelf_inventory),
                 },
             }
 
@@ -274,6 +287,9 @@ class RosBridge(Node):
                                  self._on_candidates, latched)
         self.create_subscription(String, '/dsr01/curobo/obstacles',
                                  self._on_obstacles, reliable_qos)
+        # 매대 품목 재고 (webcam 발행 JSON: {"can":1,"bottle":0,"snack":1})
+        self.create_subscription(String, '/dashboard/shelf_inventory',
+                                 self._on_shelf_inv, reliable_qos)
 
         # 그리퍼 상태
         if _GRIPPER_STATE_AVAIL:
@@ -305,6 +321,13 @@ class RosBridge(Node):
 
     def _on_grasp_class(self, msg: String) -> None:
         self.store.set_grasp_class(msg.data)
+
+    def _on_shelf_inv(self, msg: String) -> None:
+        try:
+            import json
+            self.store.set_shelf_inventory(json.loads(msg.data))
+        except Exception:
+            pass
 
     def _on_pose(self, which: str, msg: PoseStamped) -> None:
         self.store.set_pose(which, _pose_to_dict(msg))

@@ -164,6 +164,29 @@ def camera_stream():
         gen, media_type='multipart/x-mixed-replace; boundary=frame')
 
 
+# ── RViz 화면 MJPEG (충돌구체 포함 3D 뷰) ────────────────────────────
+_rviz_cap = None
+
+
+def _get_rviz_cap():
+    global _rviz_cap
+    if _rviz_cap is None:
+        from rviz_capture import RvizCapture
+        _rviz_cap = RvizCapture(win_name='rviz', fps=8)
+    return _rviz_cap
+
+
+@app.get('/api/rviz/stream')
+def rviz_stream():
+    try:
+        cap = _get_rviz_cap()
+        return StreamingResponse(
+            cap.mjpeg_generator(),
+            media_type='multipart/x-mixed-replace; boundary=frame')
+    except Exception as e:
+        return JSONResponse({'error': str(e)}, status_code=503)
+
+
 # ── 조회 REST (WS 못 쓰는 클라이언트/디버그용) ──────────────────────
 @app.get('/api/state')
 def get_state():
