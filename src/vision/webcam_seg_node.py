@@ -871,6 +871,8 @@ class WebcamSegNode(Node):
         self.pub_grasp_candidates = self.create_publisher(
             PoseArray, '/dsr01/curobo/grasp_candidates', latched)
         self.pub_obstacles   = self.create_publisher(String,      '/dsr01/curobo/obstacles',   10)
+        # ★대시보드 "매대 정리 시작" 버튼 → /dashboard/operator_cmd 구독 → 'a'(auto_restock) 트리거
+        self.create_subscription(String, '/dashboard/operator_cmd', self._operator_cmd_cb, 10)
         self.cli_open = (self.create_client(
             SetPosition, '/gripper_service/set_position',
             callback_group=cb_group) if _SETPOS_AVAIL else None)
@@ -1692,9 +1694,21 @@ class WebcamSegNode(Node):
             f"[g] goalset 후보 {len(pa.poses)}개 발행 (/dsr01/curobo/grasp_candidates)")
 
     # ───────────────────────── 자동 진열 ('a' 키) ─────────────────────────
+    def _operator_cmd_cb(self, msg):
+        """대시보드 /dashboard/operator_cmd 수신 → 'a'(auto_restock) 와 동일 동작.
+        start/auto/restock/매대정리 → 시작, abort/stop/cancel → 중단."""
+        cmd = (msg.data or '').strip().lower()
+        self.get_logger().info(f"[operator_cmd] 수신: '{cmd}'")
+        if cmd in ('start', 'auto', 'restock', 'a', '매대정리', '매대 정리 시작'):
+            self.get_logger().info("[operator_cmd] → 자동 진열 시작 (대시보드 버튼)")
+            self.auto_restock()
+        elif cmd in ('abort', 'stop', 'cancel', '중단', '정지'):
+            self.get_logger().info("[operator_cmd] → 자동 진열 중단")
+            self._auto_running = False
+
     def auto_restock(self):
         """'a' 키: 전자동 진열 루프.
-        v(매대확인)→없는 제품 파악→h(테이블뷰)→없는 제품 매칭 물체 중 x작은순(동률 y작은순)
+        v(매대확인)→없는 제품 파악→h(테이블뷰)→없는 제품 매칭 물체 중 y작은순(동률 x작은순)
         선택→lock→g(첫 파지)→p(픽)→픽완료 대기→place(매대 슬롯)→다 채울 때까지 반복.
         백그라운드 스레드 (디스플레이 비블록). 중단: 다시 'a' 또는 SPACE(비상정지)."""
         if getattr(self, '_auto_running', False):
@@ -1703,18 +1717,25 @@ class WebcamSegNode(Node):
         self._auto_running = True
         threading.Thread(target=self._auto_restock_worker, daemon=True).start()
 
-    def _auto_wait_settle(self, timeout=30.0, settle_n=8):
-        """팔(eye-in-hand 카메라 T_cam2base)이 멈출 때까지 대기 = 모션 완료 감지.
-        _go_shelf_and_check 의 도착감지와 동일 원리(2mm 이내 연속 정지)."""
+    def _auto_wait_settle(self, timeout=30.0, settle_n=8, min_move=0.03):
+        """팔(eye-in-hand 카메라 T_cam2base)이 '움직였다가 멈출' 때까지 대기 = 모션 완료 감지.
+        ★중요: 픽은 그리퍼 열기(Step1)로 시작해서 팔이 잠깐 안 움직임 → 그 정지를 모션완료로
+        오판하면 place 가 너무 일찍 호출돼 빈손으로 매대로 감(사용자 지적 2026-06-19).
+        그래서 시작위치 대비 min_move(기본 3cm) 이상 '움직인 뒤'에만 정지를 완료로 인정."""
         time.sleep(1.2)                     # 이동 시작 대기(출발 전 '정지' 오판 방지)
         t0 = time.time(); last = None; stable = 0
+        start_p = None; moved = False
         while time.time() - t0 < timeout:
             T = self.T_cam2base
             if T is not None:
                 p = np.asarray(T)[:3, 3].astype(float)
+                if start_p is None:
+                    start_p = p
+                if np.linalg.norm(p - start_p) > min_move:
+                    moved = True            # 팔이 실제로 움직이기 시작함
                 if last is not None and np.linalg.norm(p - last) < 0.002:
                     stable += 1
-                    if stable >= settle_n:
+                    if moved and stable >= settle_n:   # ★움직인 뒤 멈췄을 때만 완료
                         return True
                 else:
                     stable = 0
@@ -1760,20 +1781,34 @@ class WebcamSegNode(Node):
                 self._auto_wait_settle(timeout=25.0)
                 time.sleep(1.5)
 
-                # 3) 남은 제품과 매칭되는 검출 중 x작은→y작은 순으로 선택
+                # 3) ★검출이 나타날 때까지 최대 10초 폴링 후 선택 (테이블뷰 도착 직후엔
+                #   검출이 아직 갱신 안 돼 비어있음 → 바로 break 되던 문제. 사용자 2026-06-19)
+                #   남은 제품과 매칭되는 검출 중 y작은→x작은 순으로 선택.
+                #   ★최소 수집시간(_det_min) 동안 모든 물체가 다 뜰 때까지 모은 뒤 선택 →
+                #   일찍 골라서 엉뚱한 거(아직 안 뜬 y작은 물체 대신 먼저 뜬 것) 잡던 문제 해결.
+                _det_wait = float(os.environ.get('WSN_AUTO_DETECT_WAIT', '15'))
+                _det_min = float(os.environ.get('WSN_AUTO_DETECT_MIN', '10'))   # 10초 본 뒤 선택 (사용자)
                 cands = []
-                for d in list(self.detections):
-                    cb = d.get('center_base')
-                    if cb is None:
-                        continue
-                    for mk in remaining:
-                        if self._missing_match(d.get('name'), mk):
-                            cands.append((float(cb[0]), float(cb[1]), mk, d))
-                            break
+                _t_det = time.time()
+                while time.time() - _t_det < _det_wait and self._auto_running:
+                    cands = []
+                    for d in list(self.detections):
+                        cb = d.get('center_base')
+                        if cb is None:
+                            continue
+                        for mk in remaining:
+                            if self._missing_match(d.get('name'), mk):
+                                cands.append((float(cb[0]), float(cb[1]), mk, d))
+                                break
+                    # 후보 있고 + 최소 수집시간 지났으면 선택 (그 전엔 계속 모음 = 모든 물체 등장 대기)
+                    if cands and (time.time() - _t_det) >= _det_min:
+                        log.info(f'[auto] 검출 확보: {len(cands)}개 (대기 {time.time()-_t_det:.1f}s)')
+                        break
+                    time.sleep(0.3)
                 if not cands:
-                    log.warn(f'[auto] 테이블에서 {remaining} 매칭 물체 못 찾음 — 종료')
+                    log.warn(f'[auto] 테이블에서 {remaining} 매칭 물체 못 찾음 ({_det_wait:.0f}초 대기 후) — 종료')
                     break
-                cands.sort(key=lambda c: (c[0], c[1]))       # x작은→동률시 y작은
+                cands.sort(key=lambda c: (c[1], c[0]))       # y작은→동률시 x작은 (사용자 2026-06-18)
                 x, y, mk, det = cands[0]
                 log.info(f'[auto] 선택: {det.get("name")} (→{mk}) '
                          f'x={x*1000:.0f} y={y*1000:.0f}mm')
@@ -1782,6 +1817,7 @@ class WebcamSegNode(Node):
                 self.locked = True
                 self.locked_tk = det.get('_tk')
                 self.locked_idx = None
+                self.locked_class = str(det.get('name', '?'))   # lock 순간 클래스 고정
                 self.send_graspgen()
                 time.sleep(2.0)
                 if self.pending_grasp_pose is None:
@@ -1793,10 +1829,15 @@ class WebcamSegNode(Node):
                     self.locked = False; self.locked_tk = None
                     time.sleep(1.0); continue
 
-                # 5) 픽 모션 완료 대기 (pregrasp→grasp→lift). 팔 정지로 감지.
-                log.info('[auto] 픽 모션 대기...')
-                self._auto_wait_settle(timeout=50.0, settle_n=12)
-                time.sleep(2.0)
+                # 5) 픽 전체(open→pregrasp→전진→잡기→lift ≈47s) 완료까지 충분히 고정 대기.
+                #   ★중간 스텝 정지(pregrasp 후 2s, 잡기 중 팔 정지 등)를 모션완료로 오판해
+                #   place 를 일찍 불러서 — 안 잡고 매대로 가고, place의 그리퍼열기가 잡기와
+                #   충돌하던 문제 → 고정대기로 확실히 분리. (사용자 2026-06-19)
+                _pw = float(os.environ.get('WSN_AUTO_PICK_WAIT', '55'))
+                log.info(f'[auto] 픽 완료 대기 {_pw:.0f}s (open→pregrasp→전진→잡기→lift)...')
+                _t_pw = time.time()
+                while time.time() - _t_pw < _pw and self._auto_running:
+                    time.sleep(0.5)
 
                 # 6) place — curobo /move_to_place (grasp_class=물체이름 기준 슬롯)
                 if self.cli_place is not None and self.cli_place.service_is_ready():
@@ -1938,6 +1979,19 @@ class WebcamSegNode(Node):
         if det.get('gg_label') == 'snack_bag' or 'snack' in _nm0:
             self._snack_topdown_grasp(det, cloud)
             return
+        # ── 캔·바틀이 '누워있으면' 수직(top-down) 파지 (모션 확인용 활성화 2026-06-19) ──
+        #   서있는 캔/바틀은 옆면 수평 파지(아래 기본 로직)지만, 누우면 위에서 수직으로 잡아야 함.
+        #   center_base z 가 WSN_CYL_LIE_Z(기본 5.5cm) 미만이면 바닥에 누운 것으로 간주.
+        #   _snack_topdown_grasp 가 top-down(approach=-Z, 핑거축=장축) 템플릿이라 그대로 재활용.
+        _is_cyl0 = (det.get('gg_label') in ('can', 'pet_bottle')
+                    or 'can' in _nm0 or 'bottle' in _nm0)
+        _cz = float(np.asarray(det.get('center_base', [0, 0, 1.0]), dtype=float)[2])
+        _lie_th = float(os.environ.get('WSN_CYL_LIE_Z', '0.055'))   # 5.5cm
+        if _is_cyl0 and _cz < _lie_th:
+            self.get_logger().info(
+                f"[g] 캔/바틀 누움 감지 (z={_cz*100:.1f}cm < {_lie_th*100:.1f}cm) → 수직 top-down 파지")
+            self._snack_topdown_grasp(det, cloud)   # 위에서 수직 중심 파지 (누운 원통)
+            return
         center = cloud.mean(axis=0)
         pc = (cloud - center).astype(np.float32)   # 중심정규화 후 추론
         try:
@@ -2028,11 +2082,11 @@ class WebcamSegNode(Node):
         C = np.asarray(det.get('center_base'), dtype=float)
         if self.grasp_fixed_z is not None:
             C[2] = self.grasp_fixed_z   # 잡는 높이 고정 (검출 z 무시)
-        # ★X축 오프셋을 파지중심 C 에 적용 → goalset 후보(candidates)·standoff 둘 다 반영.
-        #   (goalset 모드는 pick_pose 무시하고 candidates 씀 → advance_and_grip 에 넣으면 무시됨)
-        #   캔/바틀 기본 3.5cm, 바틀 +2cm. env: WSN_S_X_OFFSET / WSN_BOTTLE_X_EXTRA.
-        _xo = float(os.environ.get('WSN_S_X_OFFSET', '0.010'))
-        if _ggl == 'pet_bottle' or 'bottle' in str(det.get('name', '')).lower():
+        # ★X축 오프셋은 더 이상 C 에 섞지 않음 — curobo 가 '축방향 전진 전에' 별도 단계로
+        #   월드 X 0.5cm 옆이동(CUROBO_PICK_X_SHIFT). C 에 섞으면 cuRobo 전진경로가
+        #   X 로 갔다 돌아오며 흔들려서(사용자 지적 2026-06-18) 분리함. 여기선 C=물체중심.
+        _xo = float(os.environ.get('WSN_S_X_OFFSET', '0.0'))
+        if _xo and (_ggl == 'pet_bottle' or 'bottle' in str(det.get('name', '')).lower()):
             _xo += float(os.environ.get('WSN_BOTTLE_X_EXTRA', '0.0'))
         C[0] += _xo
         # pending = (캔중심 C, quat, approach) — s/p 모두 C 기준으로 계산.
@@ -2225,11 +2279,13 @@ class WebcamSegNode(Node):
         C, quat, approach = self.pending_grasp_pose   # C=캔중심
         # 타깃 외 물체 장애물 발행 → curobo world 갱신 대기 후 pick 발행
         self._publish_obstacles(self._selected())
-        # 파지 대상 클래스 발행 → curobo 가 물성별 전류(grasp_force_params.yaml) 적용
+        # 파지 대상 클래스 발행 → curobo 가 물성별 전류(grasp_force_params.yaml) + 매대좌표 적용.
+        #   ★lock 순간 고정 저장된 locked_class 우선 (화면 표시와 동일 = live 재분류로 안 어긋남).
         _sel = self._selected()
-        if _sel is not None and _sel.get('name'):
-            self.pub_grasp_class.publish(String(data=str(_sel['name'])))
-            self.get_logger().info(f"[p] 파지 클래스 발행: {_sel['name']}")
+        _cls_pub = getattr(self, 'locked_class', None) or (_sel.get('name') if _sel else None)
+        if _cls_pub:
+            self.pub_grasp_class.publish(String(data=str(_cls_pub)))
+            self.get_logger().info(f"[p] 파지 클래스 발행: {_cls_pub} (lock 고정)")
         time.sleep(0.3)
         # 집기: 그리퍼밑동 = 캔중심 - 그리퍼길이*approach (손가락이 캔중심에 닿음).
         adv = np.asarray(C, dtype=float) - self.gripper_offset * np.asarray(approach)
@@ -3496,6 +3552,22 @@ class WebcamSegNode(Node):
                                 vis, kor, (x1, kor_y),
                                 size=ksize, color_bgr=(255, 255, 0), bg=True)
 
+                # ★GroundingDINO 검출 시각화 — 매대재고 판정에 쓰는 그 검출(gd_results) 주황 박스.
+                #   conf ≥ 매대임계(WSN_SHELF_CONF) 인 것 = "매대에 있다"로 카운트(밝은주황+[재고O]).
+                #   매대뷰에서 화면엔 없는데 '있다'고 판정되는 GD 오검출을 눈으로 확인 가능. WSN_GD_VIZ=0 끔.
+                if os.environ.get('WSN_GD_VIZ', '1') != '0':
+                    _sthr = float(os.environ.get('WSN_SHELF_CONF', '0.55'))
+                    with self.gd_lock:
+                        _gdv = list(self.gd_results)
+                    for _r in _gdv:
+                        gx1, gy1, gx2, gy2, gph, gcf = (int(_r[0]), int(_r[1]), int(_r[2]),
+                                                        int(_r[3]), str(_r[4]), float(_r[5]))
+                        _on = (gcf >= _sthr)
+                        _gc = (0, 140, 255) if _on else (110, 130, 160)   # 밝은주황 vs 흐림
+                        cv2.rectangle(vis, (gx1, gy1), (gx2, gy2), _gc, 2)
+                        cv2.putText(vis, f"GD:{gph} {gcf:.2f}",
+                                    (gx1, gy2 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, _gc, 2)
+
                 # YOLOE: open-vocab 검출 (시안색 박스 + 라벨)
                 if self.yoloe is not None:
                     try:
@@ -3719,6 +3791,11 @@ class WebcamSegNode(Node):
                             if out is None:
                                 continue
                             cu, cv_y, base_xyz = out
+                            # ★테이블 표면/펑보드 구멍 오검출 제거: z(높이)가 바닥이면 skip.
+                            #   실물(snack≈+38, can≈+71, bottle≈+151)은 z≥~35mm, 테이블 표면/
+                            #   구멍은 ~-30~+15mm → WSN_DET_ZMIN(기본 18) 미만은 버림. (사용자 2026-06-19)
+                            if float(base_xyz[2]) < float(os.environ.get('WSN_DET_ZMIN', '18')):
+                                continue
                             seg_centers.append((cu, cv_y))   # GD-only 중복 방지용
                             try:
                                 seg_boxes.append((int(bbox[0]), int(bbox[1]),
@@ -4116,13 +4193,16 @@ class WebcamSegNode(Node):
                     _x1, _y1, _x2, _y2 = _d['bbox']
                     _is_sel = (self.locked and _d.get('_tk') == self.locked_tk)
                     # 락 걸린 상태에서 타깃 외 검출 = 장애물(빨강 OBS). 미락이면 회색.
+                    # 번호 박스에 검출 클래스명 표기 → 어떤 클래스로 규명됐는지 확인용 (사용자 2026-06-19)
+                    _nm = str(_d.get('name', '?'))
+                    _num = _d.get('num', '?')
                     if _is_sel:
-                        _col = (0, 255, 0); _lab = f"[{_d.get('num', '?')}]"
+                        _col = (0, 255, 0); _lab = f"[{_num}] {_nm} <SEL>"
                     elif self.locked:
                         _col = (0, 0, 255)            # 빨강 = curobo 장애물
-                        _lab = f"[{_d.get('num', '?')}] OBS"
+                        _lab = f"[{_num}] {_nm} OBS"
                     else:
-                        _col = (200, 200, 200); _lab = f"[{_d.get('num', '?')}]"
+                        _col = (200, 200, 200); _lab = f"[{_num}] {_nm}"
                     cv2.rectangle(vis, (_x1, _y1), (_x2, _y2), _col,
                                   3 if _is_sel else 2)
                     cv2.putText(vis, _lab, (_x1, _y1 - 6),
@@ -4154,8 +4234,11 @@ class WebcamSegNode(Node):
                     cv2.putText(vis, "OBS", (_pb[0], _pb[1] - 4),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
                 if self.locked and self.locked_tk is not None:
-                    _lnum = self._det_track.get(self.locked_tk, {}).get('num', '?')
-                    cv2.putText(vis, f"LOCKED [{_lnum}] (r=unlock)",
+                    _ltrk = self._det_track.get(self.locked_tk, {})
+                    _lnum = _ltrk.get('num', '?')
+                    # ★lock 순간 고정 저장된 클래스 표시 (live 검출 아님 — 전류/매대좌표에 쓰는 그 클래스)
+                    _lcls = str(getattr(self, 'locked_class', None) or '?')
+                    cv2.putText(vis, f"LOCKED [{_lnum}] = {_lcls}  (r=unlock)",
                                 (10, 76), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                 if self.pending_grasp_pose is not None:
                     _pb = self.pending_grasp_pose[0]
@@ -4217,8 +4300,10 @@ class WebcamSegNode(Node):
                         self.locked = True
                         self.locked_tk = _match.get('_tk')
                         self.locked_idx = None
+                        # ★lock 순간 클래스 고정 저장 → 화면/전류/매대좌표 모두 이걸로 (사용자 2026-06-19)
+                        self.locked_class = str(_match.get('name', '?'))
                         self.get_logger().info(
-                            f"LOCKED [{_wantnum}] {_match['name']}")
+                            f"LOCKED [{_wantnum}] {self.locked_class}")
                 if k == ord('h') and '`' not in self.keys_held:
                     # 'h': 높은 scout 자세(카메라가 depth 범위 위)로 복귀
                     self._go_product_view()

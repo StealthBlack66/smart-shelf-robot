@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Smart Shelf Robot · Dashboard</title>
+    <script type="module" crossorigin src="/assets/index-CvpKLj7R.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-C-KV5KSF.css">
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- ★매대 정리 시작 빨간 버튼 (dist 직접 주입, React #root 밖이라 안 지워짐) -->
+    <button id="restockBtn">🟥 매대 정리 시작</button>
+    <div id="restockMsg"></div>
+    <style>
+      #restockBtn {
+        position: fixed; top: 16px; left: 50%; transform: translateX(-50%);
+        z-index: 999999; background: #e11d1d; color: #fff;
+        font-size: 22px; font-weight: 800; padding: 16px 40px;
+        border: none; border-radius: 12px; box-shadow: 0 4px 18px rgba(0,0,0,.45);
+        cursor: pointer; letter-spacing: 1px;
+      }
+      #restockBtn:hover { background: #c00; }
+      #restockBtn:active { transform: translateX(-50%) scale(.96); }
+      #restockMsg {
+        position: fixed; top: 74px; left: 50%; transform: translateX(-50%);
+        z-index: 999999; color: #fff; background: rgba(0,0,0,.7);
+        padding: 8px 16px; border-radius: 8px; font-size: 15px; display: none;
+      }
+    </style>
+    <script>
+      (function () {
+        var btn = document.getElementById('restockBtn');
+        var msg = document.getElementById('restockMsg');
+        function show(t) { msg.textContent = t; msg.style.display = 'block'; }
+        btn.addEventListener('click', function () {
+          show('매대 정리 시작 요청 중...');
+          fetch('/api/operator/cmd', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cmd: 'start' })
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (j) { show('✅ 매대 정리 시작됨 (' + (j.label || 'start') + ')'); })
+            .catch(function (e) { show('❌ 요청 실패: ' + e); })
+            .finally(function () { setTimeout(function () { msg.style.display = 'none'; }, 4000); });
+        });
+      })();
+    </script>
+  </body>
+</html>

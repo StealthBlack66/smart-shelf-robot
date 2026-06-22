@@ -46,6 +46,7 @@ from curobo.wrap.reacher.motion_gen import MotionGen, MotionGenConfig, MotionGen
 from curobo.geom.types import WorldConfig, Cuboid
 
 from dsr_msgs2.srv import MoveSplineJoint, MoveJoint, MoveLine, GetCurrentPosx, MoveStop
+from dsr_msgs2.srv import FlangeSerialOpen, FlangeSerialClose, FlangeSerialWrite
 from dsr_gripper_tcp_interfaces.srv import SetPosition
 from dsr_gripper_tcp_interfaces.action import SafeGrasp
 
@@ -190,6 +191,11 @@ class ArmControllerNode(Node):
         self.act_safe_grasp   = ActionClient(self, SafeGrasp,
                                              '/gripper_service/safe_grasp',
                                              callback_group=self.service_cb_group)
+        # ★flange_serial 직접 Modbus 경로 (DRL TCP 브리지 20002 가 죽을 때 우회 — 2026-06-18).
+        #   DRL 브리지(gripper_service)가 좀비/리셋이면 flange RS485 로 직접 그리퍼 제어.
+        self.cli_fs_open  = _cli(FlangeSerialOpen,  '/dsr01/gripper/flange_serial_open')
+        self.cli_fs_close = _cli(FlangeSerialClose, '/dsr01/gripper/flange_serial_close')
+        self.cli_fs_write = _cli(FlangeSerialWrite, '/dsr01/gripper/flange_serial_write')
 
         self.get_logger().info("========================================")
         self.get_logger().info("ArmControllerNode 준비 완료 (Pipeline A + B)")
@@ -351,11 +357,11 @@ class ArmControllerNode(Node):
         → move_stop → safe_grasp → lift. 캔에 비스듬히 내려박지 않고 파지축으로 곧게 진입."""
         pos, ori = pose.pose.position, pose.pose.orientation
         quat_wxyz = [ori.w, ori.x, ori.y, ori.z]
-        LIFT_HEIGHT = 0.15  # m
+        LIFT_HEIGHT = float(os.environ.get('CUROBO_LIFT_HEIGHT', '0.30'))  # m (15→30cm, 사용자 2026-06-18)
         # 축방향 접근거리 — 물체별: snack 6cm(그대로), can/bottle 8cm (사용자 요청).
         _cls = (self.grasp_class or '').lower()
         STANDOFF = (float(os.environ.get('CUROBO_SNACK_STANDOFF', '0.06')) if 'snack' in _cls
-                    else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.08')))
+                    else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.10')))
 
         grasp = np.array([pos.x, pos.y, pos.z], dtype=float)
         if grasp[2] < self.TCP_Z_MIN:
@@ -365,7 +371,16 @@ class ArmControllerNode(Node):
         # 접근축 = 그리퍼 Z (orientation 3번째 열). 프리그래스프 = 파지점 - STANDOFF·approach.
         approach = self._quat_to_rotm(quat_wxyz)[:, 2]
         approach = approach / (np.linalg.norm(approach) + 1e-9)
-        pre = grasp - STANDOFF * approach
+        # ★월드 X offset 을 프리그래스프에 합침 → 프리그래스프로 이동하면서 X 도 같이 감
+        #   (별도 단계 아님). 이후 전진은 approach 방향 직선이라 X 성분 없음. (사용자 2026-06-18)
+        #   바틀/캔 따로: 바틀=CUROBO_PICK_X_SHIFT_BOTTLE, 그 외(캔)=CUROBO_PICK_X_SHIFT
+        _cls = (self.grasp_class or '').lower()
+        if 'bottle' in _cls or 'pet' in _cls:
+            _xs = float(os.environ.get('CUROBO_PICK_X_SHIFT_BOTTLE', '0.030'))
+        else:
+            _xs = float(os.environ.get('CUROBO_PICK_X_SHIFT', '0.015'))
+        self.get_logger().info(f"[X offset] class={_cls or '?'} → X {_xs*100:.1f}cm")
+        pre = grasp - STANDOFF * approach + np.array([_xs, 0.0, 0.0], dtype=float)
 
         self.get_logger().info("=== PICK Step 1/5: 그리퍼 열기 ===")
         self.gripper_open()
@@ -387,19 +402,13 @@ class ArmControllerNode(Node):
         # 프리그래스프에서 실제 풀린 자세(원본/180°플립) — 전진도 같은 자세로 (손목 연속)
         q = getattr(self, '_last_plan_quat_wxyz', quat_wxyz)  # [w,x,y,z]
 
-        # Step 3: 같은 자세로 grasp 지점까지 cuRobo joint 경로 전진.
-        #   MoveLine(오일러 ZYZ b=90° 짐벌락 → 직진중 손목 90° 튐) 회피.
-        #   현재(프리그래스프) joint 에서 seed → 손목 연속, allow_yaw_retry=False(재플립 금지).
+        # Step 3: approach 방향으로 STANDOFF 직선 전진 (MoveLine, 현재 TCP 자세 그대로 유지
+        #   → 손목 안 돌고 cuRobo 처럼 휘지 않음). X 0.5cm 는 프리그래스프에 이미 합쳐졌으니
+        #   여기선 순수 축방향 직진만. (사용자 지적: cuRobo joint 전진이 X 로 흔들흔들 2026-06-18)
         self.get_logger().info(
-            f"=== PICK Step 3/5: 축방향 전진 {STANDOFF*100:.0f}cm (cuRobo joint, 손목연속) "
-            f"→ ({grasp[0]*1000:.0f},{grasp[1]*1000:.0f},{grasp[2]*1000:.0f})mm ===")
-        traj2 = self.plan(self.current_joints, grasp.tolist(), q,
-                          allow_yaw_retry=False)
-        if traj2 is None:
-            self.get_logger().error("Pick 실패: 전진 경로계획 불가")
-            return
-        if not self.execute_spline(traj2):
-            self.get_logger().error("Pick 실패: 전진 실행 실패")
+            f"=== PICK Step 3/5: 축방향 직선 전진 {STANDOFF*100:.0f}cm (MoveLine, 자세유지) ===")
+        if not self._advance_along(approach, STANDOFF, vel=60.0):
+            self.get_logger().error("Pick 실패: 축방향 전진(MoveLine) 실패")
             return
         time.sleep(1.5)
 
@@ -434,7 +443,7 @@ class ArmControllerNode(Node):
         # 축방향 접근거리 — can/bottle 8cm (사용자 요청). snack 은 candidates 없어 여기 안 옴.
         _cls = (self.grasp_class or '').lower()
         _pgs = (float(os.environ.get('CUROBO_SNACK_STANDOFF', '0.06')) if 'snack' in _cls
-                else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.08')))
+                else float(os.environ.get('CUROBO_CYL_STANDOFF', '0.10')))
         _pl = np.zeros((1, N, 3), dtype=np.float32)
         _ql = np.zeros((1, N, 4), dtype=np.float32)
         for i, (p, q) in enumerate(cands):
@@ -496,7 +505,7 @@ class ArmControllerNode(Node):
         time.sleep(1.5)
 
         self.get_logger().info("=== PICK(goalset) 4/4: 수직 상승 ===")
-        self.lift_straight_up(0.15, vel=50.0)
+        self.lift_straight_up(float(os.environ.get('CUROBO_LIFT_HEIGHT', '0.30')), vel=50.0)
         time.sleep(1.5)
         self.get_logger().info("=== PICK(goalset) 완료 ===")
         return True
@@ -700,12 +709,24 @@ class ArmControllerNode(Node):
         _v = vel * self.VEL_SCALE
         req.vel = [_v, 30.0 * self.VEL_SCALE]; req.acc = [_v, 30.0 * self.VEL_SCALE]
         req.time = 0.0; req.ref = 0; req.mode = 0
-        req.blend_type = 0; req.sync_type = 1
+        req.blend_type = 0; req.sync_type = 0
         self.get_logger().info(
             f"전진(자세유지): ({cur[0]:.0f},{cur[1]:.0f},{cur[2]:.0f}) → "
             f"({cur[0]+a[0]:.0f},{cur[1]+a[1]:.0f},{cur[2]+a[2]:.0f})mm "
             f"rz={cur[5]:.0f}° 유지")
-        return self._wait_for_motion(self.cli_movel.call_async(req), "MoveLine전진")
+        fut = self.cli_movel.call_async(req)
+        t0 = time.time()
+        while not fut.done() and (time.time() - t0) < 5.0:
+            time.sleep(0.05)
+        if not (fut.done() and fut.result() and fut.result().success):
+            self.get_logger().error("MoveLine 접수 실패"); return False
+        # ★MoveLine 서비스는 접수 즉시 반환(sync_type 무관, movej 와 동일) → 실제 이동시간만큼
+        #   대기해야 다음 단계 move_stop(QSTOP)이 전진을 중간에 안 끊음. 안 기다리면 10cm 를
+        #   다 못 가고 멈춤 = "안 감" (cuRobo→MoveLine 교체 시 회귀, 2026-06-18 수정).
+        _dur = (dist_m * 1000.0) / max(_v, 1.0) + 2.0
+        self.get_logger().info(f"MoveLine전진 명령 OK — 이동 완료까지 {_dur:.1f}s 대기")
+        time.sleep(_dur)
+        return True
 
     def _quat_yaw(self, quat_wxyz, dyaw):
         """tool Z축 기준 dyaw 회전 (대칭 그리퍼 등가 파지)"""
@@ -901,6 +922,8 @@ class ArmControllerNode(Node):
 
     # ── 그리퍼 ───────────────────────────────────────────────
 
+    # ── 그리퍼 = gripper_service(DRL 브리지 20002) 경로. flange 직접경로는 이 그리퍼
+    #   에서 응답 안 함(0바이트)·DRL INITIALIZE 방해 → 원복함 (2026-06-19).
     def gripper_open(self, position=None, timeout_sec=3.0):
         if position is None:
             position = int(self.get_parameter('grasp_open_position').value)
