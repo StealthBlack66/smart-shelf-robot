@@ -1714,9 +1714,47 @@ class WebcamSegNode(Node):
         if cmd in ('start', 'auto', 'restock', 'a', '매대정리', '매대 정리 시작'):
             self.get_logger().info("[operator_cmd] → 자동 진열 시작 (대시보드 버튼)")
             self.auto_restock()
-        elif cmd in ('abort', 'stop', 'cancel', '중단', '정지'):
+        elif cmd in ('abort', 'stop', '중단', '정지'):
             self.get_logger().info("[operator_cmd] → 자동 진열 중단")
             self._auto_running = False
+        # ── 대시보드 수동 버튼 (웹캠 키 = 명칭 버튼) ──
+        elif cmd in ('home', 'h'):            # h: 홈(product view) 이동
+            self.get_logger().info("[operator_cmd] → 홈위치(product view) 이동")
+            self._go_product_view()
+        elif cmd in ('shelf', 'v'):           # v: 매대뷰 + 재고확인
+            self.get_logger().info("[operator_cmd] → 매대위치 이동 + 재고확인")
+            self._go_shelf_and_check()
+        elif cmd in ('grasp', 'g'):           # g: GraspGen 파지생성(미리보기)
+            self.get_logger().info("[operator_cmd] → 파지 생성(GraspGen)")
+            self.send_graspgen()
+        elif cmd in ('pick', 'p'):            # p: 전진+집기+lift
+            self.get_logger().info("[operator_cmd] → 전진+집기")
+            self.advance_and_grip()
+        elif cmd in ('open', 'o'):            # o: 그리퍼 열기
+            self.get_logger().info("[operator_cmd] → 그리퍼 열기")
+            self._gripper_open_call(label='dashboard', position=0)
+        elif cmd in ('unlock', 'r', 'cancel'):  # r: 락 해제/미리보기 취소
+            self.locked = False
+            self.locked_tk = None
+            self.locked_idx = None
+            self.clear_grasp_preview()
+            self.get_logger().info("[operator_cmd] → UNLOCKED(취소)")
+        elif cmd.startswith('lock:'):           # 물체 선택 (1-9 번호 lock)
+            try:
+                _n = int(cmd.split(':', 1)[1])
+            except Exception:
+                _n = None
+            _match = next((d for d in self.detections
+                           if d.get('num') == _n), None) if _n else None
+            if _match is not None:
+                self.locked = True
+                self.locked_tk = _match.get('_tk')
+                self.locked_idx = None
+                self.locked_class = str(_match.get('name', '?'))
+                self.get_logger().info(
+                    f"[operator_cmd] LOCKED [{_n}] {self.locked_class}")
+            else:
+                self.get_logger().warn(f"[operator_cmd] 물체 #{_n} 검출 없음")
 
     def auto_restock(self):
         """'a' 키: 전자동 진열 루프.
@@ -1933,18 +1971,41 @@ class WebcamSegNode(Node):
         depth 불필요라 먼 매대도 잡히고, 학습모델이라 배경(소화기 등) 오검출도 없음.
         N초간 보고 프레임 다수에서 보이면 present (깜빡임 무시). (WSN_SHELF_VIEW_SEC 기본 5초)"""
         view_sec = float(os.environ.get('WSN_SHELF_VIEW_SEC', '5.0'))
+        settle = float(os.environ.get('WSN_SHELF_SETTLE', '2.5'))   # 도착 직후 노이즈 무시
         thr = float(os.environ.get('WSN_SHELF_CONF', '0.45'))
+        max_mm = float(os.environ.get('WSN_SHELF_MAX_MM', '1000'))  # 박스 depth 이보다 멀면 배경
         KW = {'bottle': ('bottle', 'pet'), 'can': ('can',), 'snack': ('snack',)}
         seen = {k: 0 for k in KW}
         _frames = 0
         t0 = time.time()
         while time.time() - t0 < view_sec:
-            ys = list(getattr(self, 'yolo_seg_results', []))   # 학습 YOLO 원본 2D [(name,conf)]
+            # ★도착 직후(settle)는 블러·정착·손움직임 노이즈 → 집계 안 하고 정착만 대기.
+            #   뒷부분(안정된 후반)만 집계 (사용자 2026-06-23).
+            if time.time() - t0 < settle:
+                time.sleep(0.1)
+                continue
+            ys = list(getattr(self, 'yolo_seg_results', []))   # [(name, conf, bbox)]
+            depth = getattr(self, '_last_depth', None)
             _frames += 1
             _hit = {k: False for k in KW}
-            for (nm, cf) in ys:
+            for _it in ys:
+                nm = _it[0]; cf = float(_it[1])
+                bbox = _it[2] if len(_it) > 2 else None
                 if cf < thr:
                     continue
+                # ★depth 필터: 박스 전체 유효 depth 중앙값이 멀거나(>max_mm) 무효(0=cap초과
+                #   =배경)면 제외 → 배경 책상 물병 등 '매대 밖' 물체 무시. (사용자 2026-06-23)
+                if depth is not None and bbox is not None:
+                    Hd, Wd = depth.shape[:2]
+                    x1 = max(0, int(bbox[0])); y1 = max(0, int(bbox[1]))
+                    x2 = min(Wd, int(bbox[2])); y2 = min(Hd, int(bbox[3]))
+                    dmm = 0.0
+                    if x2 > x1 and y2 > y1:
+                        box = depth[y1:y2, x1:x2]
+                        v = box[box > 0]
+                        dmm = float(np.median(v)) if v.size >= 10 else 0.0
+                    if dmm <= 0 or dmm > max_mm:
+                        continue   # 배경 → 무시
                 nml = str(nm).lower()
                 for k, kws in KW.items():
                     if any(w in nml for w in kws):
@@ -1953,8 +2014,8 @@ class WebcamSegNode(Node):
                 if _hit[k]:
                     seen[k] += 1
             time.sleep(0.15)
-        # 전체 프레임의 20% 이상(최소 2프레임) 보이면 present — 한두 프레임 깜빡임은 무시
-        need = max(2, int(_frames * 0.2))
+        # 후반 집계 프레임의 40% 이상(최소 2) 일관 검출 = present (깜빡임·노이즈 제거)
+        need = max(2, int(_frames * 0.4))
         present = {k: (seen[k] >= need) for k in KW}
         missing = [k for k in KW if not present[k]]
         self.shelf_missing = missing
@@ -1963,7 +2024,8 @@ class WebcamSegNode(Node):
             self.shelf_inv[k] = 1 if present[k] else 0
         self._publish_shelf_inv()
         self.get_logger().info(
-            f"[매대재고] (YOLO2D {view_sec:.0f}s/{_frames}프레임 conf>={thr}, present>={need}) "
+            f"[매대재고] (YOLO2D 후반{view_sec-settle:.0f}s/{_frames}프레임 conf>={thr} "
+            f"depth<{max_mm:.0f}mm, present>={need}) "
             + "  ".join(f"{k}={'O' if present[k] else 'X'}({seen[k]}/{_frames})" for k in KW)
             + f"  → 바닥에서 집을것={missing if missing else '없음(다 채워짐)'}")
         return missing
@@ -3152,8 +3214,11 @@ class WebcamSegNode(Node):
                         _ys = []
                         if res is not None and res.boxes is not None:
                             for _b in res.boxes:
+                                _xy = _b.xyxy[0].tolist()
                                 _ys.append((str(self.yolo.names[int(_b.cls)]),
-                                            float(_b.conf)))
+                                            float(_b.conf),
+                                            (int(_xy[0]), int(_xy[1]),
+                                             int(_xy[2]), int(_xy[3]))))
                         self.yolo_seg_results = _ys
                     except Exception:
                         self.yolo_seg_results = []
@@ -4276,7 +4341,7 @@ class WebcamSegNode(Node):
                         f"[DBG_DET] tracks={len(self.detections)} {_info} "
                         f"| depth_clusters={len(_dobs)} "
                         f"{[[round(o['pos'][0]*1000),round(o['pos'][1]*1000)] for o in _dobs]} "
-                        f"| YOLO2D={[(n, round(c,2)) for (n,c) in getattr(self,'yolo_seg_results',[])]}")
+                        f"| YOLO2D={[(_t[0], round(_t[1],2)) for _t in getattr(self,'yolo_seg_results',[])]}")
                 # 잠긴 물체를 인덱스가 아닌 트랙키(위치)로 추종 → 리스트가 재정렬돼도 유지
                 if self.locked and self.locked_tk is not None:
                     if self.locked_tk in self._det_track:

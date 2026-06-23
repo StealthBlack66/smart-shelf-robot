@@ -172,7 +172,7 @@ def _get_rviz_cap():
     global _rviz_cap
     if _rviz_cap is None:
         from rviz_capture import RvizCapture
-        _rviz_cap = RvizCapture(win_name='rviz', fps=8)
+        _rviz_cap = RvizCapture(win_name="rviz", fps=3)
     return _rviz_cap
 
 

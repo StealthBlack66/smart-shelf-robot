@@ -105,10 +105,42 @@ function ShelfInventoryPanel({ s }: { s: Snapshot }) {
     ['스낵 (snack)', inv.snack],
   ]
   return (
-    <Panel title="매대 물품 품목" className="col-8">
+    <Panel title="매대 물품 품목" className="col-4">
       <div className="stat-grid">
         {items.map(([label, n]) => (
           <Stat key={label} label={label} value={`${n}개`} tone={n > 0 ? 'ok' : 'warn'} />
+        ))}
+      </div>
+    </Panel>
+  )
+}
+
+function ManualControlPanel() {
+  // 웹캠 키 = 명칭 버튼 (대시보드에서 클릭으로 사용). /dashboard/operator_cmd 발행
+  const send = (cmd: string) => { api.operatorCmd(cmd) }
+  const btns: [string, string][] = [
+    ['home', '🏠 홈위치 (H)'],
+    ['shelf', '🛒 매대위치 (V)'],
+    ['grasp', '✋ 파지생성 (G)'],
+    ['pick', '⬇ 전진+집기 (P)'],
+    ['open', '✊ 그리퍼 열기 (O)'],
+    ['unlock', '✖ 취소/언락 (R)'],
+  ]
+  const nums = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+  return (
+    <Panel title="수동 제어 (웹캠 키)" className="col-4">
+      <div className="muted" style={{ marginBottom: 6 }}>물체 선택 (화면 번호로 lock)</div>
+      <div className="btn-row" style={{ flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+        {nums.map((n) => (
+          <button key={n} onClick={() => send(`lock:${n}`)}
+            style={{ flex: '1 1 9%', minWidth: 34 }}>{n}</button>
+        ))}
+      </div>
+      <div className="muted" style={{ marginBottom: 6 }}>동작</div>
+      <div className="btn-row" style={{ flexWrap: 'wrap', gap: 8 }}>
+        {btns.map(([cmd, label]) => (
+          <button key={cmd} onClick={() => send(cmd)}
+            style={{ flex: '1 1 46%' }}>{label}</button>
         ))}
       </div>
     </Panel>
@@ -148,6 +180,7 @@ export default function App() {
 
           <ShelfInventoryPanel s={data.snapshot} />
           <OperatorPanel state={data.snapshot.state} />
+          <ManualControlPanel />
         </div>
       )}
     </>

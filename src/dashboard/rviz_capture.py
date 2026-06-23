@@ -26,9 +26,11 @@ def _make_placeholder(text='RViz 대기'):
 class RvizCapture:
     """RViz 창을 주기적으로 캡처해 최신 JPEG 프레임 보유."""
 
-    def __init__(self, win_name='RViz', fps=8):
+    def __init__(self, win_name='RViz', fps=3):
+        # ★fps 낮춤(8→3) + 캡처 다운스케일 → 로봇 RT 제어 CPU 경합 완화 (2026-06-23)
         self.win_name = win_name
         self.period = 1.0 / float(fps)
+        self._down = float(os.environ.get('RVIZ_CAP_DOWNSCALE', '0.6'))  # 캡처 축소비
         self._disp = None
         self._win = None
         self._lock = threading.Lock()
@@ -109,8 +111,11 @@ class RvizCapture:
                 if self._win is not None:
                     bgr = self._grab(self._win)
                     if bgr is not None:
+                        if self._down < 0.99:
+                            bgr = cv2.resize(bgr, None, fx=self._down, fy=self._down,
+                                             interpolation=cv2.INTER_AREA)
                         ok, jpg = cv2.imencode(
-                            '.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                            '.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, 60])
                         if ok:
                             with self._lock:
                                 self._frame = jpg.tobytes()
